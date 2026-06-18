@@ -2,45 +2,49 @@
 
 package tapedrive
 
-// Raw Linux SCSI tape (st) constants and structures, taken verbatim from
-// <linux/mtio.h>. This file holds the wire-level layer; the byte-oriented
-// Reader/Seeker API lives in tapedrive.go.
+// Raw Linux SCSI tape (st) constants, structures, and ioctl helpers, taken
+// from <linux/mtio.h> and <asm-generic/ioctl.h>. This is the wire-level layer;
+// the block-oriented API lives in tapedrive.go.
 
 import (
 	"errors"
-	"os"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// ioctl requests, computed from the _IOW/_IOR macros in <asm-generic/ioctl.h>
-// so the embedded struct-size field is always correct (a wrong size field is
+// ErrEndOfData is returned by ReadBlock when the drive signals end of recorded
+// data (two consecutive zero-length reads, per st(4)). It is distinct from
+// io.EOF, which means a single filemark was crossed (more data may follow in
+// the next file).
+var ErrEndOfData = errors.New("tapedrive: end of recorded data")
+
+// ErrShortBuffer is returned by ReadBlockInto when the supplied buffer is too
+// small for the next tape record (variable-block mode). Retry with a larger
+// buffer, or use ReadBlock which auto-sizes.
+var ErrShortBuffer = errors.New("tapedrive: buffer too small for record")
+
+// ioctl requests, computed from the _IOW/_IOR macros so the embedded
+// struct-size field always matches the actual Go struct (a wrong size field is
 // rejected by the kernel with EINVAL).
 var (
 	mtioctop = iow('m', 1, unsafe.Sizeof(mtop{}))  // MTIOCTOP  _IOW('m',1,struct mtop)
 	mtioCget = ior('m', 2, unsafe.Sizeof(mtget{})) // MTIOCGET  _IOR('m',2,struct mtget)
+	mtioCpos = ior('m', 3, unsafe.Sizeof(mtpos{})) // MTIOCPOS  _IOR('m',3,struct mtpos)
 )
 
-// Magnetic tape operations (subset; see MTIOCTOP in st(4)).
+// Magnetic tape operations (MTIOCTOP op codes; see st(4)).
 const (
-	mtfsf    = 1  // forward space over filemark
-	mtbsf    = 2  // backward space over filemark
-	mtfsr    = 3  // forward space record
-	mtbsr    = 4  // backward space record
-	mtweof   = 5  // write filemark
-	mtrew    = 6  // rewind
-	mtnop    = 8  // no op (flush + set status)
-	mtbsfm   = 10 // backward space filemark, position at FM
-	mtfsfm   = 11 // forward space filemark, position at FM
-	mteom    = 12 // go to end of recorded media
-	mtsetblk = 20 // set block length (0 = variable)
-	mtseek   = 22 // seek to block number
+	mtfsf  = 1  // forward space over filemark
+	mtbsf  = 2  // backward space over filemark
+	mtfsr  = 3  // forward space record
+	mtbsr  = 4  // backward space record
+	mtweof = 5  // write filemark
+	mtrew  = 6  // rewind
+	mtnop  = 8  // no op (flush + set status)
+	mteom  = 12 // go to end of recorded media
+	mtseek = 22 // seek to block number (SCSI LOCATE)
 )
-
-// errnoENOMEM matches the ENOMEM reported by st(4) when a read buffer is too
-// small for the next physical block.
-const errnoENOMEM = unix.ENOMEM
 
 // mtop is the argument to MTIOCTOP.
 type mtop struct {
@@ -48,11 +52,9 @@ type mtop struct {
 	Count int32
 }
 
-// mtget is the argument to MTIOCGET. Layout must match <linux/mtio.h> on the
-// target arch. On x86-64, __kernel_daddr_t (used for mt_fileno/mt_blkno) is
-// 4 bytes (int), so the struct is 48 bytes — NOT 56. Getting this wrong makes
-// the kernel reject MTIOCGET with EINVAL because the size field embedded in
-// the ioctl number won't match.
+// mtget is the argument to MTIOCGET. Layout must match <linux/mtio.h>. On
+// x86-64, mt_fileno/mt_blkno are __kernel_daddr_t (int32), so the struct is
+// 48 bytes — NOT 56. A mismatch makes the kernel reject MTIOCGET with EINVAL.
 type mtget struct {
 	Type   int64
 	Resid  int64
@@ -63,20 +65,24 @@ type mtget struct {
 	Blkno  int32 // __kernel_daddr_t on x86-64
 }
 
+// mtpos is the argument to MTIOCPOS.
+type mtpos struct {
+	Blkno int64
+}
+
+// Status-bit masks for mtget.Gstat (GMT_* macros in mtio.h).
+const (
+	GMTEOF    = 0x80000000 // positioned just after a filemark
+	GMTBOT    = 0x40000000 // at beginning of tape
+	GMTEOT    = 0x20000000 // a tape op reached physical end of tape
+	GMTEOD    = 0x08000000 // at end of recorded data
+	GMTWRProt = 0x04000000 // write-protected
+	GMTOnline = 0x01000000 // tape loaded and ready
+)
+
 const (
 	dsregBlksizeShift = 0
 	dsregBlksizeMask  = 0xffffff
-)
-
-// Status-bit masks for mtget.Gstat (GMT_* macros in mtio.h), exposed for
-// callers that want to interpret Status().
-const (
-	GMTEOF    = 0x80000000
-	GMTBOT    = 0x40000000
-	GMTEOT    = 0x20000000
-	GMTEOD    = 0x08000000
-	GMTWRProt = 0x04000000
-	GMTOnline = 0x01000000
 )
 
 // ioctl performs a raw tape ioctl on fd.
@@ -104,21 +110,3 @@ func ioc(dir, typ byte, nr, size uintptr) uint {
 }
 func iow(typ byte, nr, size uintptr) uint { return ioc(iocWrite, typ, nr, size) }
 func ior(typ byte, nr, size uintptr) uint { return ioc(iocRead, typ, nr, size) }
-
-// isErrno reports whether err wraps the given errno.
-func isErrno(err error, target error) bool { return errors.Is(err, target) }
-
-// fdSource adapts an *os.File to the recordSource interface used by Drive.
-// On the st driver, each read(2) returns exactly one record.
-type fdSource struct {
-	f *os.File
-}
-
-func (s *fdSource) readRecord(fetch []byte) (int, error) {
-	return s.f.Read(fetch)
-}
-
-func (s *fdSource) grow(cap int) []byte {
-	next := min(cap*2, MaxReadBuffer)
-	return make([]byte, next)
-}

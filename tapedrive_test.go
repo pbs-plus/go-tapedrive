@@ -1,190 +1,175 @@
 package tapedrive
 
 import (
-	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
-// fakeSource serves a fixed list of records (each possibly different size) and
-// then returns a zero-length record (filemark / EOD) with nil error, matching
-// the st driver's "two consecutive zero reads = EOD" model simplified to one.
-type fakeSource struct {
-	records [][]byte
-	i       int
-	grown   int
+// fakeReader serves a scripted sequence of read results (records as byte
+// slices, zero-length for filemarks, or errors). It models st(2) semantics:
+// one record per call, zero length at a filemark, ENOMEM if dst < record.
+type fakeReader struct {
+	script []fakeRead
+	i      int
 }
 
-func (s *fakeSource) readRecord(fetch []byte) (int, error) {
-	if s.i >= len(s.records) {
-		return 0, nil // end of recorded data
-	}
-	rec := s.records[s.i]
-	if len(rec) > len(fetch) {
-		return 0, fmt.Errorf("%w (block %d > fetch %d)", errnoENOMEM, len(rec), len(fetch))
-	}
-	n := copy(fetch, rec)
-	s.i++
-	return n, nil
+type fakeRead struct {
+	data []byte // record bytes; nil + zeroErr = filemark (zero read)
+	err  error  // non-nil error to return (e.g. unix.ENOMEM)
 }
 
-func (s *fakeSource) grow(cap int) []byte {
-	s.grown++
-	next := min(cap*2, MaxReadBuffer)
-	return make([]byte, next)
-}
-
-func newTestDrive(records [][]byte) *Drive {
-	return &Drive{
-		src:   &fakeSource{records: records},
-		fetch: make([]byte, 0, 8),
+func (r *fakeReader) read(dst []byte) (int, error) {
+	if r.i >= len(r.script) {
+		return 0, ErrEndOfData
 	}
-}
-
-func TestRead_VariableBlocks(t *testing.T) {
-	// Three records of sizes 5, 13, 3 — exercises arbitrary block boundaries.
-	records := [][]byte{
-		[]byte("hello"),
-		[]byte(", brave world"),
-		[]byte("!"),
-	}
-	want := []byte("hello, brave world!")
-	d := newTestDrive(records)
-
-	got, err := io.ReadAll(d)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("data mismatch:\n got %q\nwant %q", got, want)
-	}
-	if d.Position() != int64(len(want)) {
-		t.Fatalf("Position = %d, want %d", d.Position(), len(want))
-	}
-}
-
-func TestRead_AutoGrowsOnENOMEM(t *testing.T) {
-	// Start with a tiny fetch buffer; the 32-byte record forces a grow.
-	big := bytes.Repeat([]byte("Z"), 32)
-	d := newTestDrive([][]byte{big})
-	d.fetch = make([]byte, 0, 4) // smaller than the record
-
-	got, err := io.ReadAll(d)
-	if err != nil {
-		t.Fatalf("ReadAll: %v", err)
-	}
-	if !bytes.Equal(got, big) {
-		t.Fatalf("data mismatch: got %d bytes, want %d", len(got), len(big))
-	}
-	if fs, ok := d.src.(*fakeSource); !ok || fs.grown == 0 {
-		t.Fatalf("expected fetch buffer to grow, grew=%d", func() int {
-			if s, ok := d.src.(*fakeSource); ok {
-				return s.grown
-			}
-			return 0
-		}())
-	}
-}
-
-func TestRead_ShortReadsAtRecordBoundaries(t *testing.T) {
-	// 1-byte reads should still traverse multi-record content.
-	records := [][]byte{[]byte("AB"), []byte("CDE")}
-	d := newTestDrive(records)
-	var out []byte
-	buf := make([]byte, 1)
-	for {
-		n, err := d.Read(buf)
-		out = append(out, buf[:n]...)
-		if err == io.EOF {
-			break
+	fr := r.script[r.i]
+	if fr.err != nil {
+		// ENOMEM special case: do not advance, so retry-with-grow re-reads it.
+		if !errors.Is(fr.err, unix.ENOMEM) {
+			r.i++
 		}
-		if err != nil {
-			t.Fatalf("Read: %v", err)
-		}
-		if n == 0 {
-			t.Fatal("Read returned 0, nil")
-		}
+		return 0, fr.err
 	}
-	if string(out) != "ABCDE" {
-		t.Fatalf("got %q, want %q", out, "ABCDE")
+	if fr.data == nil {
+		r.i++
+		return 0, nil // filemark (zero-length read)
+	}
+	if len(fr.data) > len(dst) {
+		return 0, unix.ENOMEM // don't advance; caller grows and retries
+	}
+	r.i++
+	return copy(dst, fr.data), nil
+}
+
+func newDrive(fr *fakeReader) *Drive {
+	d := &Drive{buf: make([]byte, 0, 8)}
+	d.read = fr.read
+	return d
+}
+
+func TestReadBlock_OneRecord(t *testing.T) {
+	fr := &fakeReader{script: []fakeRead{{data: []byte("hello")}}}
+	d := newDrive(fr)
+
+	got, err := d.ReadBlock()
+	if err != nil {
+		t.Fatalf("ReadBlock: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("got %q, want %q", got, "hello")
 	}
 }
 
-func TestSeek_ForwardExact(t *testing.T) {
-	records := [][]byte{[]byte("0123456789"), []byte("ABCDEF")}
-	d := newTestDrive(records)
+func TestReadBlock_FilemarkThenNextFile(t *testing.T) {
+	// file0 "AB", filemark, file1 "CD", filemark, EOD (implicit).
+	fr := &fakeReader{script: []fakeRead{
+		{data: []byte("AB")},
+		{}, // filemark
+		{data: []byte("CD")},
+		{}, // filemark
+		{}, // EOD (second zero in a row, but reset after CD; this is the first zero of a new sequence)
+	}}
+	d := newDrive(fr)
 
-	// Seek 5 bytes forward from start: should land on '5'.
-	pos, err := d.Seek(5, io.SeekStart)
-	if err != nil {
-		t.Fatalf("Seek: %v", err)
+	// Block 0: "AB"
+	b, err := d.ReadBlock()
+	if err != nil || string(b) != "AB" {
+		t.Fatalf("read0: b=%q err=%v", b, err)
 	}
-	if pos != 5 {
-		t.Fatalf("pos = %d, want 5", pos)
-	}
-	buf := make([]byte, 4)
-	n, _ := d.Read(buf)
-	if string(buf[:n]) != "5678" {
-		t.Fatalf("read after seek = %q, want %q", buf[:n], "5678")
-	}
-
-	// Seek 2 more bytes forward across the record boundary: lands on 'C'.
-	pos, err = d.Seek(2, io.SeekCurrent)
-	if err != nil {
-		t.Fatalf("Seek current: %v", err)
-	}
-	if pos != 11 { // consumed 5 + 4 + 2
-		t.Fatalf("pos = %d, want 11", pos)
-	}
-	n, _ = d.Read(buf)
-	if string(buf[:n]) != "BCDE" {
-		t.Fatalf("read after relative seek = %q, want %q", buf[:n], "BCDE")
-	}
-}
-
-func TestSeek_BackwardRejected(t *testing.T) {
-	d := newTestDrive([][]byte{[]byte("abcdef")})
-	if _, err := d.Seek(3, io.SeekStart); err != nil {
-		t.Fatalf("initial seek: %v", err)
-	}
-	_, err := d.Seek(0, io.SeekStart)
-	if !errors.Is(err, ErrBackwardSeek) {
-		t.Fatalf("backward SeekStart err = %v, want ErrBackwardSeek", err)
-	}
-	_, err = d.Seek(-1, io.SeekCurrent)
-	if !errors.Is(err, ErrBackwardSeek) {
-		t.Fatalf("backward SeekCurrent err = %v, want ErrBackwardSeek", err)
-	}
-	_, err = d.Seek(0, io.SeekEnd)
-	if !errors.Is(err, ErrBackwardSeek) {
-		t.Fatalf("SeekEnd err = %v, want ErrBackwardSeek", err)
-	}
-}
-
-func TestSeek_NoOpSameOffset(t *testing.T) {
-	d := newTestDrive([][]byte{[]byte("abcdef")})
-	pos, err := d.Seek(3, io.SeekStart)
-	if err != nil {
-		t.Fatalf("seek: %v", err)
-	}
-	pos2, err := d.Seek(0, io.SeekCurrent)
-	if err != nil {
-		t.Fatalf("no-op seek: %v", err)
-	}
-	if pos != pos2 {
-		t.Fatalf("pos changed from %d to %d on no-op", pos, pos2)
-	}
-}
-
-func TestSeek_PastEOD(t *testing.T) {
-	d := newTestDrive([][]byte{[]byte("ab")})
-	_, err := d.Seek(10, io.SeekStart)
+	// Next: filemark → io.EOF
+	b, err = d.ReadBlock()
 	if !errors.Is(err, io.EOF) {
-		t.Fatalf("err = %v, want io.EOF", err)
+		t.Fatalf("read1: want io.EOF, got b=%q err=%v", b, err)
 	}
-	if d.Position() != 2 {
-		t.Fatalf("Position = %d, want 2 (should have consumed all available)", d.Position())
+	// Next: "CD" (next file)
+	b, err = d.ReadBlock()
+	if err != nil || string(b) != "CD" {
+		t.Fatalf("read2: b=%q err=%v", b, err)
+	}
+	// Next: filemark → io.EOF
+	b, err = d.ReadBlock()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("read3: want io.EOF, got b=%q err=%v", b, err)
+	}
+}
+
+func TestReadBlock_EODIsTwoZeros(t *testing.T) {
+	// Single record then two consecutive zero reads → first is EOF, second is EOD.
+	fr := &fakeReader{script: []fakeRead{
+		{data: []byte("X")},
+		{}, // filemark
+		{}, // EOD
+	}}
+	d := newDrive(fr)
+
+	if _, err := d.ReadBlock(); err != nil {
+		t.Fatalf("read0: %v", err)
+	}
+	_, err := d.ReadBlock()
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("read1: want io.EOF (filemark), got %v", err)
+	}
+	_, err = d.ReadBlock()
+	if !errors.Is(err, ErrEndOfData) {
+		t.Fatalf("read2: want ErrEndOfData, got %v", err)
+	}
+}
+
+func TestReadBlock_GrowsOnENOMEM(t *testing.T) {
+	// 32-byte record with an 8-byte internal buffer → ENOMEM, grow, retry.
+	big := make([]byte, 32)
+	for i := range big {
+		big[i] = 'Z'
+	}
+	fr := &fakeReader{script: []fakeRead{{data: big}}}
+	d := newDrive(fr)
+
+	got, err := d.ReadBlock()
+	if err != nil {
+		t.Fatalf("ReadBlock: %v", err)
+	}
+	if len(got) != 32 {
+		t.Fatalf("got %d bytes, want 32", len(got))
+	}
+}
+
+func TestReadBlockInto_ShortBuffer(t *testing.T) {
+	fr := &fakeReader{script: []fakeRead{{data: []byte("too long for this buf")}}}
+	d := newDrive(fr)
+
+	buf := make([]byte, 4)
+	_, err := d.ReadBlockInto(buf)
+	if !errors.Is(err, ErrShortBuffer) {
+		t.Fatalf("want ErrShortBuffer, got %v", err)
+	}
+}
+
+func TestReadBlock_PositioningResetsZeroCounter(t *testing.T) {
+	// After a filemark (zerosSeen=1), a positioning op must reset the counter
+	// so a subsequent single zero read is a fresh filemark (io.EOF), not EOD.
+	fr := &fakeReader{script: []fakeRead{
+		{data: []byte("A")},
+		{}, // filemark
+		{data: []byte("B")},
+		{}, // filemark again
+	}}
+	d := newDrive(fr)
+
+	if _, err := d.ReadBlock(); err != nil {
+		t.Fatalf("read A: %v", err)
+	}
+	if _, err := d.ReadBlock(); !errors.Is(err, io.EOF) {
+		t.Fatalf("want filemark EOF, got %v", err)
+	}
+	// Simulate a positioning op resetting the zero counter.
+	d.zerosSeen = 0
+	if b, err := d.ReadBlock(); err != nil || string(b) != "B" {
+		t.Fatalf("read B: got %q err=%v", b, err)
+	}
+	if _, err := d.ReadBlock(); !errors.Is(err, io.EOF) {
+		t.Fatalf("after reset, single zero must be EOF (filemark), got %v", err)
 	}
 }

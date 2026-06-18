@@ -4,6 +4,7 @@ package tapedrive
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"unsafe"
@@ -11,339 +12,313 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ErrBackwardSeek is returned by Seek when the requested position is before
-// the current logical byte offset.
+// Drive wraps an open SCSI tape device (st(4)) and exposes a block-oriented
+// API that maps directly onto the driver's record/filemark/block-addressing
+// model. It is the right layer for formats whose structure is defined in terms
+// of tape blocks and filemarks — notably Microsoft Tape Format (MTF/.bkf),
+// whose Physical Block Address (PBA) and Format Logical Address (FLA) scheme
+// assumes device-level block seeking.
 //
-// The Linux SCSI tape driver (st(4)) has no byte addressing: it can only
-// position by record (MTBSR/MTFSR) or by logical block number (MTSEEK).
-// Neither is byte-precise, so a backward byte seek cannot be honored exactly.
-// Rewind the drive with Rewind and then Seek forward.
-var ErrBackwardSeek = errors.New("tapedrive: backward seek not supported; use Rewind then forward seek")
-
-// DefaultReadBuffer is the size used to fetch records when the drive's own
-// block size is unknown or variable. Reads grow the fetch buffer as needed up
-// to MaxReadBuffer.
-const (
-	DefaultReadBuffer = 1 << 20 // 1 MiB
-	MaxReadBuffer     = 1 << 26 // 64 MiB (driver max ~2 MiB on most kernels)
-)
-
-// recordSource yields one tape record (possibly empty, indicating a filemark
-// or end-of-recorded-data boundary) per call. It abstracts the raw read(2) so
-// the byte-cursor and Seek math can be tested without hardware.
-type recordSource interface {
-	// readRecord fills fetch with one record and returns its length. A zero
-	// length with nil error marks the end of readable data.
-	readRecord(fetch []byte) (int, error)
-	// grow suggests a larger fetch capacity when readRecord fails with ENOMEM.
-	grow(cap int) []byte
-}
-
-// Drive wraps an open SCSI tape device file (e.g. /dev/nst0) and presents a
-// byte-oriented, buffered io.ReadSeekCloser. Block boundaries — fixed or
-// variable — are hidden: each Read drains bytes from the current record and
-// fetches the next record transparently.
+// A Drive is NOT an io.Reader/io.Seeker. Reads return whole records; seeks are
+// by device block number (PBA), not byte offset. This matches the st driver,
+// which has no byte addressing — only records (MTFSR/MTBSR), filemarks
+// (MTFSF/MTBSF), and logical block numbers (MTSEEK/MTIOCPOS).
 //
-// Open uses the no-rewind device variant (nst*) so that positioning survives
-// Close unless Rewind is called explicitly.
+// Use a non-rewinding device (nst0, not st0) so positioning survives Close.
 type Drive struct {
-	f   *os.File
-	src recordSource
+	f *os.File
 
-	// fetch is the buffer passed to read(2). It holds one record at a time.
-	fetch []byte
-	// n is the number of valid bytes in fetch after the last read.
-	n int
-	// off is the read cursor within fetch[0:n].
-	off int
+	// buf is the internal buffer used by ReadBlock. It grows on demand up to
+	// MaxBlockSize when a record is larger than the current capacity.
+	buf []byte
+	// zerosSeen tracks consecutive zero-length reads to distinguish a filemark
+	// (one zero read) from end-of-recorded-data (two zero reads), per st(4).
+	// Reset to 0 whenever a non-zero record is read or the head is moved.
+	zerosSeen int
 
-	// atEOF is true once read returned 0 at a filemark/EOD boundary.
-	atEOF bool
-	// pos is the logical byte offset consumed by the caller across all records.
-	pos int64
-
-	// rewindOnClose mirrors the no-rewind/auto-rewind device choice.
-	rewindOnClose bool
+	// read issues one driver read into dst, returning (n, err). Defaults to the
+	// raw syscall; overridable for tests. Mirrors read(2) on st: one record per
+	// call, zero length at a filemark, ENOMEM if dst < next record.
+	read func(dst []byte) (int, error)
 }
 
-// Open opens a no-rewind SCSI tape device for reading.
+// MaxBlockSize bounds the internal read buffer growth. The st driver's own
+// buffer is the real ceiling (~2 MB on most kernels); this is a safety cap.
+const MaxBlockSize = 1 << 26 // 64 MiB
+
+// Open opens a no-rewind SCSI tape device read-only.
 //
-// Use a non-rewinding device (nst0, not st0); with an auto-rewind device the
-// tape is rewound to BOT on Close, defeating Seek.
+// Use a non-rewinding device (nst*); with an auto-rewind device the tape is
+// rewound to BOT on Close.
 func Open(name string) (*Drive, error) {
-	return open(name, os.O_RDONLY, false)
+	return open(name, unix.O_RDONLY, 0)
 }
 
-// OpenFile is the general constructor. flags must include one of O_RDONLY /
-// O_WRONLY / O_RDWR. Set rewindOnClose to rewind the tape when Close is called
-// (useful with the auto-rewind device nodes).
-func OpenFile(name string, flag int, rewindOnClose bool) (*Drive, error) {
-	return open(name, flag, rewindOnClose)
+// OpenFile opens a tape device with arbitrary flags. flags must include one of
+// O_RDONLY/O_WRONLY/O_RDWR. mode is the file mode (usually 0).
+func OpenFile(name string, flags, mode int) (*Drive, error) {
+	return open(name, flags, mode)
 }
 
-func open(name string, flag int, rewindOnClose bool) (*Drive, error) {
-	// Open the device WITHOUT O_CLOEXEC. Some st drivers (and custom PBS
-	// builds) reject ioctls on fds opened with O_CLOEXEC with EINVAL, even
-	// though POSIX permits it. Strip it and rely on explicit Close.
-	flag &^= unix.O_CLOEXEC
-	fd, err := unix.Open(name, flag, 0)
+func open(name string, flags, mode int) (*Drive, error) {
+	// Open WITHOUT O_CLOEXEC: some st drivers reject ioctls on fds opened with
+	// O_CLOEXEC. Strip it and rely on explicit Close.
+	flags &^= unix.O_CLOEXEC
+	fd, err := unix.Open(name, flags, uint32(mode))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tapedrive: open %s: %w", name, err)
 	}
-	f := os.NewFile(uintptr(fd), name)
-	d := &Drive{
-		f:             f,
-		src:           &fdSource{f: f},
-		fetch:         make([]byte, 0, DefaultReadBuffer),
-		rewindOnClose: rewindOnClose,
-	}
-	// Probe the drive's configured block size. If it is fixed and non-zero we
-	// can size the fetch buffer exactly, which avoids the grow-on-demand path.
-	if bs, err := d.blockSize(); err == nil && bs > 0 {
-		d.fetch = make([]byte, bs)
-	}
+	d := &Drive{f: os.NewFile(uintptr(fd), name)}
+	d.read = func(dst []byte) (int, error) { return unix.Read(int(d.f.Fd()), dst) }
 	return d, nil
 }
 
-// Read implements io.Reader. It returns up to len(p) bytes from the current
-// record; when a record is exhausted the next record is fetched automatically.
-// It returns io.EOF when the end of recorded data (filemark at EOD) is reached.
-func (d *Drive) Read(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
+// ReadBlock reads one tape record (one variable- or fixed-size block) into buf
+// and returns its length. The returned slice view buf[:n] holds exactly one
+// record; n is the record's true size as reported by the driver.
+//
+// If buf is too small for the next record, ReadBlock grows the Drive's internal
+// buffer and reads into that instead, returning a slice that aliases the
+// internal buffer. Callers that need a stable copy should copy out of it before
+// the next ReadBlock. To guarantee reading into your own buf, size it >=
+// BlockSize() (fixed-block mode) or >= MaxBlockSize (variable-block mode).
+//
+// Return values:
+//
+//	(nil, nil)          unreachable
+//	(buf[:n], nil)      one record of n bytes
+//	(nil, io.EOF)       a filemark was crossed; no data returned. The head is
+//	                    now positioned just past the filemark, at the start of
+//	                    the next file. Another ReadBlock reads the next file.
+//	(nil, ErrEndOfData) end of recorded data (two filemarks / EOD). No more
+//	                    data follows; further reads continue to return this.
+//	(nil, err)          a genuine I/O error.
+//
+// The filemark-vs-EOD distinction matters for tape formats (MTF) that delimit
+// Data Sets with filemarks: a single io.EOF means "end of this Data Set, more
+// may follow", while ErrEndOfData means "end of medium".
+// ReadBlock reads one tape record (one variable- or fixed-size block) and
+// returns it. The returned slice aliases the Drive's internal buffer and is
+// valid only until the next ReadBlock/ReadBlockInto call — like
+// bufio.Scanner.Bytes. Copy it if you need to retain it.
+//
+// Return values:
+//
+//	(data, nil)          one record of len(data) bytes
+//	(nil, io.EOF)        a filemark was crossed; no data. The head is now just
+//	                     past the filemark at the start of the next file; a
+//	                     subsequent ReadBlock reads the next file's first block.
+//	(nil, ErrEndOfData)  end of recorded data (EOD); no more data on medium.
+//	(nil, err)           a genuine I/O error.
+//
+// The filemark-vs-EOD distinction matters for tape formats (MTF) that delimit
+// Data Sets with filemarks: io.EOF = "end of this Data Set, more may follow",
+// ErrEndOfData = "end of medium". Per st(4), EOD is two consecutive
+// zero-length reads; a single zero-length read is a filemark.
+func (d *Drive) ReadBlock() ([]byte, error) {
+	n, err := d.readInto(d.buffer())
+	if err != nil || n == 0 {
+		return nil, err
 	}
-	if d.atEOF {
-		return 0, io.EOF
-	}
-
-	var total int
-	for total < len(p) {
-		// Serve any leftover bytes in the current record first.
-		if d.off < d.n {
-			c := copy(p[total:], d.fetch[d.off:d.n])
-			d.off += c
-			d.pos += int64(c)
-			total += c
-			// io.Reader allows short reads; returning here keeps latency low
-			// and makes Read yield at record boundaries naturally.
-			return total, nil
-		}
-		// Current record drained: fetch the next one.
-		n, err := d.nextRecord()
-		if n == 0 {
-			if err == nil {
-				err = io.EOF
-			}
-			d.atEOF = true
-			if total > 0 {
-				return total, nil
-			}
-			return 0, err
-		}
-		d.n = n
-		d.off = 0
-	}
-	return total, nil
+	return d.buf[:n], nil
 }
 
-// nextRecord performs one read for a single tape record, growing the fetch
-// buffer if the driver needs more space (variable-block or oversized records).
-// It returns the record length and any error. A zero length with nil error
-// means a filemark / end-of-recorded-data boundary was crossed.
-func (d *Drive) nextRecord() (int, error) {
+// ReadBlockInto reads one record into buf and returns its length n. If buf is
+// too small for the next record, it returns ErrShortBuffer so the caller can
+// retry with a larger buffer (the required size is unknowable in advance in
+// variable-block mode; use BlockSize() for fixed-block mode, or ReadBlock for
+// auto-sized reads). See ReadBlock for the filemark/EOD error semantics.
+func (d *Drive) ReadBlockInto(buf []byte) (int, error) {
+	return d.readInto(buf)
+}
+
+// buffer returns the internal read buffer, allocating on first use.
+func (d *Drive) buffer() []byte {
+	if cap(d.buf) == 0 {
+		d.buf = make([]byte, 1<<20)[:0] // 1 MiB initial
+	}
+	return d.buf[:cap(d.buf)]
+}
+
+// readInto issues one read(2) into dst and classifies the result. A non-zero
+// read is a data record. A zero read is a boundary: the first is reported as
+// io.EOF (filemark), and if the NEXT call also reads zero, that is reported as
+// ErrEndOfData (EOD) — matching st(4)'s two-zero-read EOD rule. Any non-zero
+// read resets the zero counter.
+//
+// On ENOMEM (dst too small for the next record): if dst is the Drive's own
+// buffer, grow and retry; otherwise return ErrShortBuffer.
+func (d *Drive) readInto(dst []byte) (int, error) {
 	for {
-		n, err := d.src.readRecord(d.fetch[:cap(d.fetch)])
-		if err == nil || errors.Is(err, io.EOF) {
+		n, err := d.read(dst)
+		if err != nil {
+			if !errors.Is(err, unix.ENOMEM) {
+				return 0, err
+			}
+			// ENOMEM: dst too small. Grow only if dst is the internal buffer.
+			if isInternal, grown := d.maybeGrow(dst); isInternal {
+				if !grown {
+					return 0, fmt.Errorf("tapedrive: record exceeds MaxBlockSize (%d)", MaxBlockSize)
+				}
+				dst = d.buf[:cap(d.buf)]
+				continue // retry same record with bigger buffer
+			}
+			return 0, ErrShortBuffer
+		}
+		if n > 0 {
+			d.zerosSeen = 0
 			return n, nil
 		}
-		// ENOMEM: the next physical block is larger than our fetch buffer.
-		// Grow and retry (bounded by MaxReadBuffer).
-		if isErrno(err, errnoENOMEM) && cap(d.fetch) < MaxReadBuffer {
-			d.fetch = d.src.grow(cap(d.fetch))
-			continue
+		// Zero-length read: filemark or EOD.
+		d.zerosSeen++
+		if d.zerosSeen == 1 {
+			return 0, io.EOF // filemark
 		}
-		return n, err
+		return 0, ErrEndOfData // second zero in a row
 	}
 }
 
-// Seek implements io.Seeker over logical byte offsets.
-//
-// Only forward motion is supported: SeekStart/SeekCurrent offsets that move
-// the cursor ahead are honored exactly (by reading and discarding), and the
-// returned position is a real byte count. Backward seeks return ErrBackwardSeek.
-// SeekEnd returns ErrBackwardSeek as well, since the st driver reports no
-// meaningful byte length (only block/file numbers).
-//
-// The driver cannot position by byte; this implementation maintains the byte
-// cursor itself and advances it honestly.
-func (d *Drive) Seek(offset int64, whence int) (int64, error) {
-	var target int64
-	switch whence {
-	case io.SeekStart:
-		target = offset
-	case io.SeekCurrent:
-		target = d.pos + offset
-	case io.SeekEnd:
-		return d.pos, ErrBackwardSeek
-	default:
-		return d.pos, errors.New("tapedrive: invalid whence")
+// maybeGrow reports whether dst is the Drive's internal buffer and, if so,
+// doubles its capacity (up to MaxBlockSize). Returns (isInternal, didGrow).
+func (d *Drive) maybeGrow(dst []byte) (bool, bool) {
+	// dst is internal if it shares d.buf's backing array.
+	if len(dst) == 0 || cap(d.buf) == 0 {
+		return false, false
 	}
-
-	if target < 0 {
-		return d.pos, ErrBackwardSeek
+	if &dst[0] != &d.buf[:cap(d.buf)][0] {
+		return false, false
 	}
-	if target < d.pos {
-		return d.pos, ErrBackwardSeek
+	if cap(d.buf) >= MaxBlockSize {
+		return true, false
 	}
-	if target == d.pos {
-		return d.pos, nil
-	}
-
-	// Discard forward the requested delta.
-	discard := target - d.pos
-	buf := d.fetch[:cap(d.fetch)]
-	for discard > 0 {
-		if d.atEOF {
-			return d.pos, io.EOF
-		}
-		want := min(int64(len(buf)), discard)
-		n, err := d.Read(buf[:want])
-		if n > 0 {
-			discard -= int64(n)
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) && discard == 0 {
-				break
-			}
-			return d.pos, err
-		}
-	}
-	return d.pos, nil
+	d.buf = make([]byte, growCap(cap(d.buf)))
+	return true, true
 }
 
-// Position returns the logical byte offset of the next byte to be read within
-// the current file. It is reset to 0 by Rewind, FSF, BSF, or any other
-// positioning ioctl that moves the head.
-func (d *Drive) Position() int64 { return d.pos }
+func growCap(c int) int {
+	next := min(c*2, MaxBlockSize)
+	return next
+}
 
-// Status returns the raw MTIOCGET status. Per st(4), MTIOCGET must be preceded
-// by an MTNOP to flush the driver buffer and refresh status, so this issues
-// both. The GMT* constants in this package test individual bits of Gstat
-// (EOF, BOT, EOT, EOD, write-protect, online).
-func (d *Drive) Status() (mtget, error) {
+// SeekBlock positions the tape at the given Physical Block Address (PBA) using
+// the SCSI LOCATE command (MTSEEK). This is MTF's primary random-access
+// primitive: the spec's restore formula yields a PBA, and SeekBlock lands
+// there in a single hardware operation — far faster than sequential reads.
+//
+// The PBA is a device block number as reported by TellBlock/MTIOCPOS, NOT a
+// byte offset. PBAs are bidirectional: SeekBlock may seek forward or backward.
+// Not all drives support LOCATE; check Status for the drive's capabilities if
+// unsure. Requires the drive to support MTSEEK (SCSI-2 LOCATE or later).
+func (d *Drive) SeekBlock(pba int64) error {
+	if err := d.mtop(mtseek, int(pba)); err != nil {
+		return fmt.Errorf("tapedrive: seek to block %d: %w", pba, err)
+	}
+	return nil
+}
+
+// TellBlock returns the current Physical Block Address (PBA) via MTIOCPOS.
+// This is the device's notion of position — the same value MTF stores in the
+// MTF_SSET DBLK and uses as the anchor for FLA→PBA calculations.
+//
+// Requires a drive that supports READ POSITION (SCSI-2 or later). Returns an
+// error if the drive cannot report position.
+func (d *Drive) TellBlock() (int64, error) {
+	var pos mtpos
+	if err := ioctl(int(d.f.Fd()), mtioCpos, uintptr(unsafe.Pointer(&pos))); err != nil {
+		return 0, fmt.Errorf("tapedrive: tell block: %w", err)
+	}
+	return pos.Blkno, nil
+}
+
+// FSF forward-spaces over count filemarks. Use to advance across Data Sets
+// (MTF: each Data Set begins after a filemark).
+func (d *Drive) FSF(count int) error { return d.mtop(mtfsf, count) }
+
+// BSF backward-spaces over count filemarks.
+func (d *Drive) BSF(count int) error { return d.mtop(mtbsf, count) }
+
+// FSR forward-spaces over count records (blocks).
+func (d *Drive) FSR(count int) error { return d.mtop(mtfsr, count) }
+
+// BSR backward-spaces over count records (blocks).
+func (d *Drive) BSR(count int) error { return d.mtop(mtbsr, count) }
+
+// Status reports drive status as a typed struct. Per st(4), MTIOCGET must be
+// preceded by MTNOP to flush the driver buffer and refresh the status bits,
+// so Status issues both. Note: at BOT, before any media access, the
+// GMTWriteProtect bit may not reflect the physical tab reliably.
+type Status struct {
+	Online         bool  // tape loaded and ready
+	BOT            bool  // at beginning of tape
+	EOT            bool  // a tape op reached physical end of tape
+	EOD            bool  // at end of recorded data
+	EOF            bool  // positioned just after a filemark
+	WriteProtect   bool  // medium is write-protected
+	FileNumber     int64 // current file number (-1 if unknown)
+	BlockNumber    int64 // block number within current file (-1 if unknown)
+	BlockSize      int   // configured block size; 0 = variable-block mode
+	SoftErrorCount int   // recovered error count (often not maintained)
+}
+
+// Status queries MTIOCGET (preceded by MTNOP) and returns a typed Status.
+func (d *Drive) Status() (Status, error) {
 	// MTNOP flushes the buffer; required before MTIOCGET or the kernel may
 	// return EINVAL.
 	if err := d.mtop(mtnop, 1); err != nil {
-		return mtget{}, err
+		return Status{}, fmt.Errorf("tapedrive: flush (MTNOP): %w", err)
 	}
-	var st mtget
-	if err := ioctl(int(d.f.Fd()), mtioCget, uintptr(unsafe.Pointer(&st))); err != nil {
-		return mtget{}, err
+	var g mtget
+	if err := ioctl(int(d.f.Fd()), mtioCget, uintptr(unsafe.Pointer(&g))); err != nil {
+		return Status{}, fmt.Errorf("tapedrive: status (MTIOCGET): %w", err)
 	}
-	return st, nil
+	return Status{
+		Online:         g.Gstat&GMTOnline != 0,
+		BOT:            g.Gstat&GMTBOT != 0,
+		EOT:            g.Gstat&GMTEOT != 0,
+		EOD:            g.Gstat&GMTEOD != 0,
+		EOF:            g.Gstat&GMTEOF != 0,
+		WriteProtect:   g.Gstat&GMTWRProt != 0,
+		FileNumber:     int64(g.Fileno),
+		BlockNumber:    int64(g.Blkno),
+		BlockSize:      int(uint64(g.Dsreg>>dsregBlksizeShift) & dsregBlksizeMask),
+		SoftErrorCount: int(uint64(g.Erreg) & 0xffff),
+	}, nil
 }
 
-// BlockSize reports the drive's configured block size from MTIOCGET, or 0 for
-// variable-block mode. Best-effort; an error means status could not be read.
-func (d *Drive) BlockSize() (int, error) {
-	st, err := d.Status()
-	if err != nil {
-		return 0, err
-	}
-	return int((st.Dsreg >> dsregBlksizeShift) & dsregBlksizeMask), nil
-}
+// Rewind rewinds the tape to beginning of tape (BOT).
+func (d *Drive) Rewind() error { return d.mtop(mtrew, 1) }
 
-// Rewind rewinds the tape to the beginning of tape (BOT) and resets the byte
-// cursor. After Rewind, any buffered record is discarded.
-func (d *Drive) Rewind() error {
-	if err := d.mtop(mtrew, 1); err != nil {
-		return err
-	}
-	d.resetCursor()
-	return nil
-}
+// EOM positions the tape at the end of recorded data (for appending).
+func (d *Drive) EOM() error { return d.mtop(mteom, 1) }
 
-// FSF forward-spaces over count filemarks. The byte cursor is reset because
-// the head has moved to a new file.
-func (d *Drive) FSF(count int) error {
-	if err := d.mtop(mtfsf, count); err != nil {
-		return err
-	}
-	d.resetCursor()
-	return nil
-}
+// WriteFilemark writes count filemarks. Write-only; appends a Data Set
+// boundary.
+func (d *Drive) WriteFilemark(count int) error { return d.mtop(mtweof, count) }
 
-// BSF backward-spaces over count filemarks.
-func (d *Drive) BSF(count int) error {
-	if err := d.mtop(mtbsf, count); err != nil {
-		return err
-	}
-	d.resetCursor()
-	return nil
-}
-
-// FSR forward-spaces over count records. The byte cursor is reset because the
-// record buffer no longer reflects the head position.
-func (d *Drive) FSR(count int) error {
-	if err := d.mtop(mtfsr, count); err != nil {
-		return err
-	}
-	d.resetCursor()
-	return nil
-}
-
-// BSR backward-spaces over count records.
-func (d *Drive) BSR(count int) error {
-	if err := d.mtop(mtbsr, count); err != nil {
-		return err
-	}
-	d.resetCursor()
-	return nil
-}
-
-// Close releases the device. If opened with rewindOnClose the tape is rewound
-// first. Per st(4), a filemark is auto-written on close if the last operation
-// was a write.
+// Close releases the device file. Per st(4), a filemark is auto-written on
+// close if the last operation was a write. The tape is NOT rewound (use a
+// non-rewinding device and Rewind explicitly when desired).
 func (d *Drive) Close() error {
-	var err error
-	if d.rewindOnClose {
-		_ = d.Rewind()
+	if d.f == nil {
+		return nil
 	}
-	if d.f != nil {
-		err = d.f.Close()
-		d.f = nil
-	}
+	err := d.f.Close()
+	d.f = nil
 	return err
 }
 
-// File is the underlying *os.File; use it only for operations this package
-// does not cover (writing, status queries). Tampering with read position will
-// desync the byte cursor.
+// File returns the underlying *os.File for operations this package does not
+// cover. Tampering with read position or issuing raw ioctls will desync the
+// Drive's view of tape state.
 func (d *Drive) File() *os.File { return d.f }
 
-func (d *Drive) resetCursor() {
-	d.n, d.off = 0, 0
-	d.pos = 0
-	d.atEOF = false
-}
-
-// mtop executes an MTIOCTOP command.
+// mtop executes an MTIOCTOP command. Any positioning op invalidates the
+// filemark/EOD tracking state.
 func (d *Drive) mtop(op int, count int) error {
 	arg := mtop{Op: int16(op), Count: int32(count)}
-	return ioctl(int(d.f.Fd()), mtioctop, uintptr(unsafe.Pointer(&arg)))
-}
-
-// blockSize queries the drive's current block size from MTIOCGET, returning 0
-// for variable-block mode. It is best-effort.
-func (d *Drive) blockSize() (int, error) {
-	st, err := d.Status()
-	if err != nil {
-		return 0, err
+	if err := ioctl(int(d.f.Fd()), mtioctop, uintptr(unsafe.Pointer(&arg))); err != nil {
+		return err
 	}
-	return int((st.Dsreg >> dsregBlksizeShift) & dsregBlksizeMask), nil
+	d.zerosSeen = 0
+	return nil
 }
-
-// Compile-time interface satisfaction.
-var (
-	_ io.ReadSeekCloser = (*Drive)(nil)
-)

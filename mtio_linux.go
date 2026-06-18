@@ -44,6 +44,19 @@ const (
 	mtnop  = 8  // no op (flush + set status)
 	mteom  = 12 // go to end of recorded media
 	mtseek = 22 // seek to block number (SCSI LOCATE)
+	mtsetdrvbuf = 24 // set drive buffering / driver options (MTSETDRVBUFFER)
+)
+
+// MTSETDRVBUFFER subcommand masks (ored into mt_count with MT_ST_OPTIONS).
+const (
+	stSetBooleans   = 0x30000000 // MT_ST_SETBOOLEANS
+	stClearBooleans = 0x40000000 // MT_ST_CLEARBOOLEANS
+)
+
+// Boolean driver/mode option bits usable with MTSETDRVBUFFER subcommands.
+// See <linux/mtio.h> and st(4) "Boolean options".
+const (
+	stSCSI2Logical = 0x800 // MT_ST_SCSI2LOGICAL: use SCSI-2 logical block addresses for SeekBlock/TellBlock. Required for stored PBAs (e.g. MTF EOTM/ESET catalog PBAs) to be meaningful on HPE Ultrium and most modern LTO drives.
 )
 
 // mtop is the argument to MTIOCTOP.

@@ -230,6 +230,20 @@ func (d *Drive) TellBlock() (int64, error) {
 	return pos.Blkno, nil
 }
 
+// SetLogicalAddressing enables SCSI-2 logical block addressing
+// (MT_ST_SCSI2LOGICAL via MTSETDRVBUFFER). With this set, SeekBlock and
+// TellBlock use logical block addresses (which also count filemarks) instead
+// of device-specific addresses. Per st(4), this is "highly advisable" on any
+// drive that supports it.
+//
+// This MUST be enabled for stored Physical Block Addresses — such as the
+// Last ESET PBA in an MTF EOTM block, or the SSETPBA in an MTF_SSET — to be
+// meaningful: tape writers record logical PBAs, so a reader must query in the
+// same address space. Idempotent.
+func (d *Drive) SetLogicalAddressing() error {
+	return d.mtop(mtsetdrvbuf, int(stSetBooleans|stSCSI2Logical))
+}
+
 // FSF forward-spaces over count filemarks. Use to advance across Data Sets
 // (MTF: each Data Set begins after a filemark).
 func (d *Drive) FSF(count int) error { return d.mtop(mtfsf, count) }

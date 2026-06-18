@@ -22,8 +22,8 @@ library (`syscall`, `unsafe`).
 
 ```go
 t, err := tapedrive.Open("/dev/nst0",
-    tapedrive.WithBlockSize(0),            // variable-block mode
-    tapedrive.WithSCSI2Logical(true),      // required for Seek/Position on HPE Ultrium
+    tapedrive.WithBlockSize(0),       // variable-block mode (default)
+    tapedrive.WithSCSI2Logical(true), // required for Seek/Position on HPE Ultrium
 )
 if err != nil { log.Fatal(err) }
 defer t.Close()
@@ -37,14 +37,44 @@ if err := t.Rewind(); err != nil { log.Fatal(err) }
 
 buf := make([]byte, maxBlock)
 for {
-    n, err := t.Read(buf)          // io.EOF = filemark boundary
-    if err == io.EOF { break }
-    if err != nil { log.Fatal(err) }
+    n, err := t.Read(buf)
+    switch {
+    case errors.Is(err, tapedrive.ErrEndOfData):
+        return // two filemarks in a row: no more recorded data on the tape
+    case errors.Is(err, io.EOF):
+        continue // crossed one filemark: end of the current file
+    case err != nil:
+        return err
+    }
     consume(buf[:n])
 }
 ```
 
 It slots directly into `io.Copy`, `bufio`, `archive/tar`, etc.
+
+## Read semantics
+
+The `st` driver returns zero bytes at a filemark. This library follows
+`st.rst` exactly:
+
+* A **single** zero-byte read is a filemark boundary — reported as `io.EOF`.
+  The next `Read` returns the first block of the next file.
+* **Two consecutive** zero-byte reads mean end of recorded data — reported as
+  `ErrEndOfData`.
+* Any tape-movement op (`Seek`, `Rewind`, `ForwardSpace*`, `Offline`, …)
+  resets the consecutive-zero counter, so a single filemark after a reposition
+  is always `io.EOF`, never a spurious `ErrEndOfData`.
+
+## Write semantics near end of medium
+
+Per `st.rst` ("EOM Behaviour When Writing"), the first `ENOSPC` from the drive
+is the **early warning**: the current write still completes and one trailer
+write is still permitted.
+
+* The first `ENOSPC` is reported as `ErrEarlyWarning` — the caller may retry
+  once to write a trailer.
+* A subsequent `ENOSPC` is reported as `ErrEndOfMedium` — the physical end of
+  medium has been reached.
 
 ## HPE Ultrium (LTO) drives — seek & tell
 
@@ -67,36 +97,70 @@ t.EnableLogicalSeek()
 `Seek` then maps to `MTSEEK` and `Position`/`Tell` to `MTIOCPOS`, both in
 logical block numbers.
 
+## Status
+
+`Status()` decodes the `MTIOCGET` response into plain Go fields:
+
+| Field | Source |
+| --- | --- |
+| `Type` | `mt_type` (e.g. `MT_ISSCSI2`) |
+| `Resid` | `mt_resid` |
+| `BlockSize` / `Density` | decoded from `mt_dsreg` |
+| `Gstat` | raw `mt_gstat` bits; use the predicates below |
+| `SoftErrorCount` | recovered-error count (low 16 bits of `mt_erreg`) |
+| `FileNo` / `BlkNo` | `mt_fileno` / `mt_blkno` (`-1` when unknown) |
+
+Predicates: `EOF`, `BOT`, `EOT`, `EOD`, `Online`, `WriteProtected`,
+`TapeLoaded`, `CleaningNeeded`, `Setmark`.
+
 ## API surface
 
-`Open`, `OpenFile`, `Fd`, plus the `io` methods. Tape-specific operations:
+Lifecycle / io: `Open`, `OpenFile`, `Close`, `Fd`, `Read`, `Write`, `Seek`,
+`Position` / `Tell`, `Status`.
 
-`Rewind`, `Offline`, `Retension`, `Erase`, `SpaceToEnd`,
-`ForwardSpaceFilemarks`, `BackwardSpaceFilemarks`,
-`ForwardSpaceRecords`, `BackwardSpaceRecords`,
-`ForwardSpaceSetmarks`, `BackwardSpaceSetmarks`,
-`WriteFilemarks`, `WriteFilemarksImmediate`, `WriteSetmarks`,
-`SetBlockSize`, `SetDensity`, `SetCompression`,
-`LockDoor`, `UnlockDoor`, `Load`, `Unload`, `Flush`,
-`Seek`, `Position`/`Tell`, `Status`,
-`SetDriverBooleans`, `ClearDriverBooleans`, `EnableLogicalSeek`,
-`SetTimeout`, `SetWriteThreshold`, and a low-level `MTOP`.
+Options (functional options on `Open`): `WithFlags`, `WithMode`,
+`WithBlockSize`, `WithSCSI2Logical`, `WithDriverOptions`.
+
+Tape movement: `Rewind`, `Offline`, `Retension`, `Erase`, `SpaceToEnd`,
+`ForwardSpaceFilemarks`, `BackwardSpaceFilemarks`, `ForwardSpaceRecords`,
+`BackwardSpaceRecords`, `ForwardSpaceSetmarks`, `BackwardSpaceSetmarks`,
+`Load`, `Unload`, `Flush`.
+
+Writing marks: `WriteFilemarks`, `WriteFilemarksImmediate`, `WriteSetmarks`.
+
+Drive settings: `SetBlockSize`, `SetDensity`, `SetCompression`, `LockDoor`,
+`UnlockDoor`, `SetDriverBooleans`, `ClearDriverBooleans`, `EnableLogicalSeek`,
+`SetTimeout`, `SetWriteThreshold`.
+
+Low level: `MTOP(op, count)` plus the exported `Op*` operation constants
+(`OpFSF`, `OpWEOF`, `OpSeek`, …) and `Opt*` driver-option masks
+(`OptSCSI2Logical`, `OptTwoFM`, …) for use with `WithDriverOptions` /
+`SetDriverBooleans` / `ClearDriverBooleans`.
 
 ## Error handling
 
-Sentinels: `ErrEndOfData`, `ErrEndOfMedium`, `ErrNoTape`,
-`ErrWriteProtected`, `ErrCleanRequested`, `ErrNotOpen`. Match with
-`errors.Is`. `Read` returns `io.EOF` at a filemark boundary so it composes
-cleanly with the rest of `io`.
+Sentinels (match with `errors.Is`):
+
+* `io.EOF` — filemark boundary crossed (end of the current file).
+* `ErrEndOfData` — two consecutive filemarks; no more recorded data.
+* `ErrEarlyWarning` — first write `ENOSPC`; a trailer write is still allowed.
+* `ErrEndOfMedium` — physical end of medium reached.
+* `ErrNotOpen` — method called after `Close`.
 
 ## Platform
 
-Linux only (the `st` driver). The ioctl request numbers are computed at
-package init from the asm-generic `_IOC` macros, so the package is correct on
-every Linux architecture without arch-specific constants.
+Linux only (the `st` driver). The ioctl request numbers are computed from the
+asm-generic `_IOC` encoding — the layout used on **x86, amd64, arm64,
+riscv64, loong64 and s390x**. MIPS, PowerPC and SPARC use a different `_IOC`
+encoding and are not supported without arch-specific variants.
+
+The `struct mtget` wire layout matches the kernel/glibc UAPI (the final
+`mt_fileno` / `mt_blkno` fields are `__daddr_t`, i.e. 4-byte `int`, so
+`sizeof == 48` and `MTIOCGET == 0x80306d02`).
 
 ## References
 
 * `Documentation/scsi/st.rst` — the Linux kernel SCSI tape driver docs.
+* `man 4 st` — the st driver manual page.
 * `include/uapi/linux/mtio.h` — `struct mtop`, `struct mtget`, `struct mtpos`,
   the `MT*` operations and `MT_ST_*` option bits.

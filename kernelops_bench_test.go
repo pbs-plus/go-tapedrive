@@ -31,14 +31,14 @@ func BenchmarkStatusDecode(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		s := Status{
-			Type:      g.Type,
-			Resid:     g.Resid,
-			BlockSize: int(uint64(g.Dsreg) & dsBlksizeMask),
-			Density:   int((uint64(g.Dsreg) >> dsDensityShift) & 0xff),
-			Gstat:     g.Gstat,
-			Erreg:     g.Erreg,
-			FileNo:    g.Fileno,
-			BlkNo:     g.Blkno,
+			Type:           g.Type,
+			Resid:          g.Resid,
+			BlockSize:      int(uint64(g.Dsreg) & dsBlksizeMask),
+			Density:        int((uint64(g.Dsreg) >> dsDensityShift) & 0xff),
+			Gstat:          g.Gstat,
+			SoftErrorCount: int(uint64(g.Erreg) & dsSofterrMask),
+			FileNo:         int64(g.Fileno),
+			BlkNo:          int64(g.Blkno),
 		}
 		_ = s
 	}

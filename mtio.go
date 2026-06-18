@@ -21,7 +21,6 @@ const (
 	OpSetBlk      int16 = 20 // set block length (0 = variable)
 	OpSetDensity  int16 = 21 // set density code
 	OpSeek        int16 = 22 // seek to block (QFA / SCSI-2 logical)
-	OpTell        int16 = 23 // tell block position
 	OpSetDrvBuf   int16 = 24 // set drive buffering / driver options
 	OpFSS         int16 = 25 // space forward over count setmarks
 	OpBSS         int16 = 26 // space backward over count setmarks
@@ -75,12 +74,10 @@ const (
 	OptNoWaitEOF     = 0x8000
 )
 
-// Status register (mt_dsreg) subfield shifts/masks.
+// Status register (mt_dsreg) and error register (mt_erreg) subfield masks.
 const (
-	dsBlksizeShift = 0
 	dsBlksizeMask  = 0xffffff
 	dsDensityShift = 24
-	dsDensityMask  = 0xff000000
 	dsSofterrMask  = 0xffff
 )
 
@@ -98,24 +95,24 @@ const (
 	gmtCLN     = 0x00008000 // cleaning requested
 )
 
-// mtop is the C "struct mtop" { short mt_op; int mt_count; } from mtio.h.
-// sizeof == 8 on amd64/arm64 (2 bytes padding between mt_op and mt_count).
+// mtop mirrors "struct mtop" { short mt_op; int mt_count; } from mtio.h.
 type mtop struct {
 	Op    int16
 	_     [2]byte
 	Count int32
 }
 
-// mtget is "struct mtget" from mtio.h. Field order matches the kernel UAPI so
-// the ioctl copies the right bytes into each field.
+// mtget mirrors "struct mtget" from mtio.h, including the kernel UAPI field
+// widths: mt_fileno and mt_blkno are __daddr_t (int, 4 bytes), not long, so
+// sizeof == 48 and the MTIOCGET request number matches the kernel's.
 type mtget struct {
 	Type   int64 // mt_type
 	Resid  int64 // mt_resid
 	Dsreg  int64 // mt_dsreg
 	Gstat  int64 // mt_gstat
 	Erreg  int64 // mt_erreg
-	Fileno int64 // mt_fileno
-	Blkno  int64 // mt_blkno
+	Fileno int32 // mt_fileno (__daddr_t)
+	Blkno  int32 // mt_blkno  (__daddr_t)
 }
 
 // mtpos is "struct mtpos" { long mt_blkno; } from mtio.h.
@@ -129,8 +126,9 @@ const (
 	sizeofMtpos = int(unsafe.Sizeof(mtpos{}))
 )
 
-// ioctl request numbers, computed via the asm-generic _IOC macros so they are
-// correct on any Linux arch without arch-specific constants.
+// ioctl request numbers, computed via the asm-generic _IOC macros (the layout
+// used on x86, amd64, arm64, riscv64, loong64 and s390x). MIPS, PowerPC and
+// SPARC use a different _IOC encoding and would need arch-specific variants.
 var (
 	ioctlMTIOCTOP = makeIOC(iocWriteDir, 'm', 1, sizeofMtop)
 	ioctlMTIOCGET = makeIOC(iocReadDir, 'm', 2, sizeofMtget)

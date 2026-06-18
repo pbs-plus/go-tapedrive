@@ -221,7 +221,9 @@ func (d *Drive) Seek(offset int64, whence int) (int64, error) {
 	return d.pos, nil
 }
 
-// Position returns the logical byte offset of the next byte to be read.
+// Position returns the logical byte offset of the next byte to be read within
+// the current file. It is reset to 0 by Rewind, FSF, BSF, or any other
+// positioning ioctl that moves the head.
 func (d *Drive) Position() int64 { return d.pos }
 
 // Status returns the raw MTIOCGET status. Per st(4), MTIOCGET must be preceded
@@ -255,6 +257,44 @@ func (d *Drive) BlockSize() (int, error) {
 // cursor. After Rewind, any buffered record is discarded.
 func (d *Drive) Rewind() error {
 	if err := d.mtop(mtrew, 1); err != nil {
+		return err
+	}
+	d.resetCursor()
+	return nil
+}
+
+// FSF forward-spaces over count filemarks. The byte cursor is reset because
+// the head has moved to a new file.
+func (d *Drive) FSF(count int) error {
+	if err := d.mtop(mtfsf, count); err != nil {
+		return err
+	}
+	d.resetCursor()
+	return nil
+}
+
+// BSF backward-spaces over count filemarks.
+func (d *Drive) BSF(count int) error {
+	if err := d.mtop(mtbsf, count); err != nil {
+		return err
+	}
+	d.resetCursor()
+	return nil
+}
+
+// FSR forward-spaces over count records. The byte cursor is reset because the
+// record buffer no longer reflects the head position.
+func (d *Drive) FSR(count int) error {
+	if err := d.mtop(mtfsr, count); err != nil {
+		return err
+	}
+	d.resetCursor()
+	return nil
+}
+
+// BSR backward-spaces over count records.
+func (d *Drive) BSR(count int) error {
+	if err := d.mtop(mtbsr, count); err != nil {
 		return err
 	}
 	d.resetCursor()

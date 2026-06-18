@@ -24,6 +24,7 @@ var (
 
 // Magnetic tape operations (subset; see MTIOCTOP in st(4)).
 const (
+	mtfsf    = 1  // forward space over filemark
 	mtbsf    = 2  // backward space over filemark
 	mtfsr    = 3  // forward space record
 	mtbsr    = 4  // backward space record

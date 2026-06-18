@@ -35,15 +35,11 @@ var (
 
 // Magnetic tape operations (MTIOCTOP op codes; see st(4)).
 const (
-	mtfsf  = 1  // forward space over filemark
-	mtbsf  = 2  // backward space over filemark
-	mtfsr  = 3  // forward space record
-	mtbsr  = 4  // backward space record
-	mtweof = 5  // write filemark
-	mtrew  = 6  // rewind
-	mtnop  = 8  // no op (flush + set status)
-	mteom  = 12 // go to end of recorded media
-	mtseek = 22 // seek to block number (SCSI LOCATE)
+	mtfsf       = 1  // forward space over filemark
+	mtrew       = 6  // rewind
+	mtnop       = 8  // no op (flush + set status)
+	mteom       = 12 // go to end of recorded media
+	mtseek      = 22 // seek to block number (SCSI LOCATE)
 	mtsetdrvbuf = 24 // set drive buffering / driver options (MTSETDRVBUFFER)
 )
 

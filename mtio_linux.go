@@ -9,15 +9,17 @@ package tapedrive
 import (
 	"errors"
 	"os"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
-// ioctl requests.
-const (
-	mtioctop = 0x40086d01 // _IOW('m', 1, struct mtop) = MTIOCTOP
-	mtioCget = 0x80206d02 // _IOR('m', 2, struct mtget) = MTIOCGET
-	mtioCpos = 0x80046d03 // _IOR('m', 3, struct mtpos) = MTIOCPOS
+// ioctl requests, computed from the _IOW/_IOR macros in <asm-generic/ioctl.h>
+// so the embedded struct-size field is always correct (a wrong size field is
+// rejected by the kernel with EINVAL).
+var (
+	mtioctop = iow('m', 1, unsafe.Sizeof(mtop{}))  // MTIOCTOP  _IOW('m',1,struct mtop)
+	mtioCget = ior('m', 2, unsafe.Sizeof(mtget{})) // MTIOCGET  _IOR('m',2,struct mtget)
 )
 
 // Magnetic tape operations (subset; see MTIOCTOP in st(4)).
@@ -45,15 +47,19 @@ type mtop struct {
 	Count int32
 }
 
-// mtget is the argument to MTIOCGET. Layout must match <linux/mtio.h>.
+// mtget is the argument to MTIOCGET. Layout must match <linux/mtio.h> on the
+// target arch. On x86-64, __kernel_daddr_t (used for mt_fileno/mt_blkno) is
+// 4 bytes (int), so the struct is 48 bytes — NOT 56. Getting this wrong makes
+// the kernel reject MTIOCGET with EINVAL because the size field embedded in
+// the ioctl number won't match.
 type mtget struct {
 	Type   int64
 	Resid  int64
 	Dsreg  int64
 	Gstat  int64
 	Erreg  int64
-	Fileno int64
-	Blkno  int64
+	Fileno int32 // __kernel_daddr_t on x86-64
+	Blkno  int32 // __kernel_daddr_t on x86-64
 }
 
 const (
@@ -80,6 +86,23 @@ func ioctl(fd int, req uint, arg uintptr) error {
 	}
 	return nil
 }
+
+// _IOC encoding from <asm-generic/ioctl.h> (DIRBITS=2, SIZEBITS=14):
+//
+//	(dir<<30) | (size<<16) | (type<<8) | nr
+//
+// _IOC_NONE=0, _IOC_WRITE=1 (user->kernel), _IOC_READ=2 (kernel->user).
+const (
+	iocNone  = 0
+	iocWrite = 1
+	iocRead  = 2
+)
+
+func ioc(dir, typ byte, nr, size uintptr) uint {
+	return uint(dir)<<30 | uint(size)<<16 | uint(typ)<<8 | uint(nr)&0xff
+}
+func iow(typ byte, nr, size uintptr) uint { return ioc(iocWrite, typ, nr, size) }
+func ior(typ byte, nr, size uintptr) uint { return ioc(iocRead, typ, nr, size) }
 
 // isErrno reports whether err wraps the given errno.
 func isErrno(err error, target error) bool { return errors.Is(err, target) }

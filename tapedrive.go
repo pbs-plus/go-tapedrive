@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 // ErrBackwardSeek is returned by Seek when the requested position is before
@@ -80,10 +82,15 @@ func OpenFile(name string, flag int, rewindOnClose bool) (*Drive, error) {
 }
 
 func open(name string, flag int, rewindOnClose bool) (*Drive, error) {
-	f, err := os.OpenFile(name, flag, 0)
+	// Open the device WITHOUT O_CLOEXEC. Some st drivers (and custom PBS
+	// builds) reject ioctls on fds opened with O_CLOEXEC with EINVAL, even
+	// though POSIX permits it. Strip it and rely on explicit Close.
+	flag &^= unix.O_CLOEXEC
+	fd, err := unix.Open(name, flag, 0)
 	if err != nil {
 		return nil, err
 	}
+	f := os.NewFile(uintptr(fd), name)
 	d := &Drive{
 		f:             f,
 		src:           &fdSource{f: f},
@@ -217,9 +224,16 @@ func (d *Drive) Seek(offset int64, whence int) (int64, error) {
 // Position returns the logical byte offset of the next byte to be read.
 func (d *Drive) Position() int64 { return d.pos }
 
-// Status returns the raw MTIOCGET status. The GMT* constants in this package
-// test individual bits of Gstat (EOF, BOT, EOT, EOD, write-protect, online).
+// Status returns the raw MTIOCGET status. Per st(4), MTIOCGET must be preceded
+// by an MTNOP to flush the driver buffer and refresh status, so this issues
+// both. The GMT* constants in this package test individual bits of Gstat
+// (EOF, BOT, EOT, EOD, write-protect, online).
 func (d *Drive) Status() (mtget, error) {
+	// MTNOP flushes the buffer; required before MTIOCGET or the kernel may
+	// return EINVAL.
+	if err := d.mtop(mtnop, 1); err != nil {
+		return mtget{}, err
+	}
 	var st mtget
 	if err := ioctl(int(d.f.Fd()), mtioCget, uintptr(unsafe.Pointer(&st))); err != nil {
 		return mtget{}, err
@@ -282,8 +296,8 @@ func (d *Drive) mtop(op int, count int) error {
 // blockSize queries the drive's current block size from MTIOCGET, returning 0
 // for variable-block mode. It is best-effort.
 func (d *Drive) blockSize() (int, error) {
-	var st mtget
-	if err := ioctl(int(d.f.Fd()), mtioCget, uintptr(unsafe.Pointer(&st))); err != nil {
+	st, err := d.Status()
+	if err != nil {
 		return 0, err
 	}
 	return int((st.Dsreg >> dsregBlksizeShift) & dsregBlksizeMask), nil

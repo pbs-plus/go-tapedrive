@@ -1,25 +1,27 @@
-// Package tapedrive provides Go io-compatible interfaces to the Linux SCSI
-// tape (st) driver.
+// Package tapedrive is a Go binding for the Linux SCSI tape (st) driver.
 //
-// A Tape implements io.Reader, io.Writer, io.Seeker, io.Closer (and therefore
-// io.ReadSeeker, io.ReadWriteSeeker, io.ReadWriteCloser, io.ReadSeekCloser,
-// io.ReadSeekCloser) over a /dev/st* or /dev/nst* device node.
+// A Tape is a handle to a /dev/st* or /dev/nst* device node. Tape is a
+// record-oriented medium — a sequence of blocks grouped into files separated
+// by filemarks — so Tape deliberately does not implement io.Reader,
+// io.Writer or io.Seeker. Those interfaces model a flat byte stream, which a
+// tape is not, and forcing them onto it (filemarks as io.EOF, byte offsets
+// for Seek, hidden zero-read counters) makes the API misleading. Instead:
 //
-// The Read/Write hot paths perform no heap allocations: all ioctl argument
-// structures and syscall registers are kept on the stack or inside the Tape
-// value, and byte slices flow directly between the caller and the kernel.
+//   - ReadBlock / WriteBlock move one physical tape block per call.
+//   - A filemark seen while reading is reported as [ErrFilemark]; the tape
+//     then sits at the first block of the next file. Two filemarks in a row
+//     with no data between them are [ErrEndOfData].
+//   - SeekBlock takes an absolute logical block number (MTSEEK); Position
+//     reads it back (MTIOCPOS). Both need logical-block addressing on HPE
+//     Ultrium drives — see WithSCSI2Logical / EnableLogicalSeek.
 //
-// Seek maps onto MTSEEK and Position/Tell onto MTIOCPOS, both in logical
-// block numbers. HPE Ultrium (LTO) drives require the MT_ST_SCSI2LOGICAL
-// option (see WithSCSI2Logical / EnableLogicalSeek) for these to be
-// meaningful; otherwise the driver uses a device-dependent address.
+// The ReadBlock / WriteBlock hot paths perform no heap allocations: all ioctl
+// argument structures and syscall registers are kept on the stack or inside
+// the Tape value, and byte slices flow directly between the caller and the
+// kernel.
 //
-// Read follows st.rst: a single zero-byte read at a filemark is reported as
-// io.EOF (end of the current file); two consecutive zero-byte reads are
-// reported as [ErrEndOfData]. Any tape-movement op resets the filemark
-// counter. Near end of medium the first write ENOSPC is [ErrEarlyWarning]
-// (one trailer write still permitted); a subsequent ENOSPC is
-// [ErrEndOfMedium].
+// Near end of medium the first write ENOSPC is [ErrEarlyWarning] (one trailer
+// write still permitted); a subsequent ENOSPC is [ErrEndOfMedium].
 //
 // The struct mtget wire layout matches the kernel/glibc UAPI: mt_fileno and
 // mt_blkno are __daddr_t (4-byte int), so sizeof == 48 and the MTIOCGET

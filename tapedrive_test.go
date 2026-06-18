@@ -3,7 +3,6 @@ package tapedrive
 import (
 	"errors"
 	"io"
-	"runtime"
 	"sync"
 	"syscall"
 	"testing"
@@ -11,18 +10,19 @@ import (
 )
 
 // fakeDevice is an in-memory stand-in for the st driver used to exercise the
-// ioctl plumbing and Read/Write/Seek logic without real hardware. It records
-// the sequence of ioctls and serves Read/Write from a ring of byte blocks.
+// ioctl plumbing and ReadBlock/WriteBlock/SeekBlock logic without real
+// hardware. It records the sequence of ioctls and serves reads/writes from a
+// ring of byte blocks.
 //
 // Like the real driver, read() returns (0, nil) at a filemark or past the end
-// of recorded data — the package turns the first such zero into io.EOF and the
-// second consecutive zero into ErrEndOfData.
+// of recorded data — the package turns the first such zero into ErrFilemark
+// and the second consecutive zero into ErrEndOfData.
 type fakeDevice struct {
 	mu          sync.Mutex
 	closed      bool
 	blocks      [][]byte // written records; nil entry == filemark sentinel
 	readIdx     int      // next record to read
-	blkno       int64    // reported by MTIOCPOS / Seek
+	blkno       int64    // reported by MTIOCPOS / SeekBlock
 	gstat       int64
 	dsreg       int64
 	erreg       int64
@@ -140,19 +140,19 @@ func mustClose(tb testing.TB, t io.Closer) {
 
 func mustRead(t *testing.T, tape *Tape, buf []byte) {
 	t.Helper()
-	if _, err := tape.Read(buf); err != nil {
+	if _, err := tape.ReadBlock(buf); err != nil {
 		t.Fatalf("read: %v", err)
 	}
 }
 
 func mustWrite(t *testing.T, tape *Tape, p []byte) {
 	t.Helper()
-	if _, err := tape.Write(p); err != nil {
+	if _, err := tape.WriteBlock(p); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 }
 
-func TestOpenFakeWriteReadRoundTrip(t *testing.T) {
+func TestWriteReadRoundTrip(t *testing.T) {
 	tape, dev := openFake(t)
 	defer mustClose(t, tape.Tape)
 
@@ -162,7 +162,7 @@ func TestOpenFakeWriteReadRoundTrip(t *testing.T) {
 		[]byte("third"),
 	}
 	for _, p := range payloads {
-		if n, err := tape.Write(p); err != nil || n != len(p) {
+		if n, err := tape.WriteBlock(p); err != nil || n != len(p) {
 			t.Fatalf("write %q: n=%d err=%v", p, n, err)
 		}
 	}
@@ -173,7 +173,7 @@ func TestOpenFakeWriteReadRoundTrip(t *testing.T) {
 	dev.readIdx = 0 // emulate rewind before reading
 	for i, want := range payloads {
 		buf := make([]byte, 256)
-		n, err := tape.Read(buf)
+		n, err := tape.ReadBlock(buf)
 		if err != nil {
 			t.Fatalf("read[%d]: %v", i, err)
 		}
@@ -181,49 +181,48 @@ func TestOpenFakeWriteReadRoundTrip(t *testing.T) {
 			t.Fatalf("read[%d] = %q, want %q", i, buf[:n], want)
 		}
 	}
-	// next read hits the filemark -> io.EOF
+	// next read hits the filemark -> ErrFilemark
 	buf := make([]byte, 256)
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("expected io.EOF at filemark, got %v", err)
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) {
+		t.Fatalf("expected ErrFilemark at filemark, got %v", err)
 	}
 }
 
-func TestSeekStartUsesMTSEEKThenPosition(t *testing.T) {
+func TestSeekBlockUsesMTSEEK(t *testing.T) {
 	tape, dev := openFake(t)
 	defer mustClose(t, tape.Tape)
 
-	got, err := tape.Seek(42, io.SeekStart)
-	if err != nil {
+	if err := tape.SeekBlock(42); err != nil {
 		t.Fatalf("seek: %v", err)
-	}
-	if got != 42 {
-		t.Fatalf("seek returned %d, want 42", got)
 	}
 	last := dev.lastMtop
 	if last.Op != OpSeek || last.Count != 42 {
 		t.Fatalf("last op = {%d,%d}, want {Seek,42}", last.Op, last.Count)
 	}
+	if got, err := tape.Position(); err != nil || got != 42 {
+		t.Fatalf("Position = (%d,%v), want (42,nil)", got, err)
+	}
 }
 
-func TestSeekCurrentOffsetsFromPosition(t *testing.T) {
+func TestSeekBlockIsAbsolute(t *testing.T) {
 	tape, dev := openFake(t)
 	defer mustClose(t, tape.Tape)
-	dev.blkno = 10
+	dev.blkno = 10 // current position must be ignored by absolute seek
 
-	got, err := tape.Seek(5, io.SeekCurrent)
-	if err != nil {
+	if err := tape.SeekBlock(5); err != nil {
 		t.Fatalf("seek: %v", err)
 	}
-	if got != 15 {
-		t.Fatalf("seek from current: got %d, want 15", got)
+	last := dev.lastMtop
+	if last.Op != OpSeek || last.Count != 5 {
+		t.Fatalf("last op = {%d,%d}, want {Seek,5}", last.Op, last.Count)
 	}
 }
 
-func TestSeekNegativePositionRejected(t *testing.T) {
+func TestSeekBlockRejectsNegative(t *testing.T) {
 	tape, _ := openFake(t)
 	defer mustClose(t, tape.Tape)
-	if _, err := tape.Seek(-1, io.SeekStart); err == nil {
-		t.Fatal("expected error for negative seek")
+	if err := tape.SeekBlock(-1); err == nil {
+		t.Fatal("expected error for negative block number")
 	}
 }
 
@@ -279,13 +278,13 @@ func TestClosedReturnsErrNotOpen(t *testing.T) {
 	if err := tape.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tape.Read(make([]byte, 8)); !errors.Is(err, ErrNotOpen) {
+	if _, err := tape.ReadBlock(make([]byte, 8)); !errors.Is(err, ErrNotOpen) {
 		t.Fatalf("read after close: %v, want ErrNotOpen", err)
 	}
-	if _, err := tape.Write([]byte("x")); !errors.Is(err, ErrNotOpen) {
+	if _, err := tape.WriteBlock([]byte("x")); !errors.Is(err, ErrNotOpen) {
 		t.Fatalf("write after close: %v, want ErrNotOpen", err)
 	}
-	if _, err := tape.Seek(0, io.SeekStart); !errors.Is(err, ErrNotOpen) {
+	if err := tape.SeekBlock(0); !errors.Is(err, ErrNotOpen) {
 		t.Fatalf("seek after close: %v, want ErrNotOpen", err)
 	}
 }
@@ -344,9 +343,6 @@ func TestMtgetLayoutMatchesKernelABI(t *testing.T) {
 // TestMTIOCIoctlNumbers pins the ioctl request numbers. MTIOCGET must encode
 // size=48 (0x30), not 56 (0x38).
 func TestMTIOCIoctlNumbers(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("ioctl numbers are Linux-specific")
-	}
 	if ioctlMTIOCTOP != 0x40086d01 {
 		t.Errorf("ioctlMTIOCTOP = %#x, want 0x40086d01", ioctlMTIOCTOP)
 	}
@@ -370,13 +366,13 @@ func TestStructSizes(t *testing.T) {
 	}
 }
 
-// TestReadFilemarkIsEOFThenEndOfData checks st.rst semantics: the first
-// zero-byte read at a filemark is io.EOF; two consecutive zeros mean end of
-// recorded data (ErrEndOfData).
-func TestReadFilemarkIsEOFThenEndOfData(t *testing.T) {
+// TestReadFilemarkThenEndOfData checks st.rst semantics: the first zero-byte
+// read at a filemark is ErrFilemark; two consecutive zeros (two filemarks with
+// no data between) mean end of recorded data (ErrEndOfData).
+func TestReadFilemarkThenEndOfData(t *testing.T) {
 	tape, _ := openFake(t)
 	defer mustClose(t, tape.Tape)
-	if _, err := tape.Write([]byte("block")); err != nil {
+	if _, err := tape.WriteBlock([]byte("block")); err != nil {
 		t.Fatal(err)
 	}
 	if err := tape.WriteFilemarks(1); err != nil {
@@ -385,20 +381,20 @@ func TestReadFilemarkIsEOFThenEndOfData(t *testing.T) {
 	tape.dev.readIdx = 0 // emulate rewind before reading
 
 	buf := make([]byte, 32)
-	if _, err := tape.Read(buf); err != nil {
+	if _, err := tape.ReadBlock(buf); err != nil {
 		t.Fatalf("read data: %v", err)
 	}
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("want io.EOF at filemark, got %v", err)
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) {
+		t.Fatalf("want ErrFilemark at filemark, got %v", err)
 	}
-	if _, err := tape.Read(buf); !errors.Is(err, ErrEndOfData) {
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrEndOfData) {
 		t.Fatalf("want ErrEndOfData after two zero reads, got %v", err)
 	}
 }
 
 // TestReadDataResetsZeroCount ensures a successful read between filemarks
-// resets the consecutive-zero counter so a later single filemark is io.EOF,
-// not a spurious ErrEndOfData.
+// resets the consecutive-zero counter so a later single filemark is
+// ErrFilemark, not a spurious ErrEndOfData.
 func TestReadDataResetsZeroCount(t *testing.T) {
 	tape, dev := openFake(t)
 	defer mustClose(t, tape.Tape)
@@ -414,21 +410,22 @@ func TestReadDataResetsZeroCount(t *testing.T) {
 
 	buf := make([]byte, 8)
 	mustRead(t, tape.Tape, buf) // "a"
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("first filemark: want io.EOF, got %v", err)
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) {
+		t.Fatalf("first filemark: want ErrFilemark, got %v", err)
 	}
 	mustRead(t, tape.Tape, buf) // "b" resets the counter
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("second filemark: want io.EOF, got %v", err)
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) {
+		t.Fatalf("second filemark: want ErrFilemark, got %v", err)
 	}
-	if _, err := tape.Read(buf); !errors.Is(err, ErrEndOfData) {
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrEndOfData) {
 		t.Fatalf("want ErrEndOfData after the final filemark, got %v", err)
 	}
 }
 
-// TestSeekResetsZeroCount ensures a tape-movement op invalidates the EOD
-// counter so a single zero read after seeking is io.EOF, not ErrEndOfData.
-func TestSeekResetsZeroCount(t *testing.T) {
+// TestSeekBlockResetsZeroCount ensures a tape-movement op invalidates the EOD
+// counter so a single zero read after seeking is ErrFilemark, not
+// ErrEndOfData.
+func TestSeekBlockResetsZeroCount(t *testing.T) {
 	tape, dev := openFake(t)
 	defer mustClose(t, tape.Tape)
 	mustWrite(t, tape.Tape, []byte("a"))
@@ -438,20 +435,20 @@ func TestSeekResetsZeroCount(t *testing.T) {
 	dev.readIdx = 0
 
 	buf := make([]byte, 8)
-	mustRead(t, tape.Tape, buf)                            // "a"
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) { // zeroCount = 1
-		t.Fatalf("want io.EOF at filemark, got %v", err)
+	mustRead(t, tape.Tape, buf)                                      // "a"
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) { // zeroCount = 1
+		t.Fatalf("want ErrFilemark at filemark, got %v", err)
 	}
-	if _, err := tape.Seek(0, io.SeekStart); err != nil { // resets counter
+	if err := tape.SeekBlock(0); err != nil { // resets counter
 		t.Fatalf("seek: %v", err)
 	}
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("after seek want io.EOF (not ErrEndOfData), got %v", err)
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) {
+		t.Fatalf("after seek want ErrFilemark (not ErrEndOfData), got %v", err)
 	}
 }
 
 // TestRewindResetsZeroCount: Rewind is a movement op and must reset the EOD
-// counter just like Seek.
+// counter just like SeekBlock.
 func TestRewindResetsZeroCount(t *testing.T) {
 	tape, dev := openFake(t)
 	defer mustClose(t, tape.Tape)
@@ -463,17 +460,17 @@ func TestRewindResetsZeroCount(t *testing.T) {
 
 	buf := make([]byte, 8)
 	mustRead(t, tape.Tape, buf)
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("want io.EOF at filemark, got %v", err)
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) {
+		t.Fatalf("want ErrFilemark at filemark, got %v", err)
 	}
 	if err := tape.Rewind(); err != nil {
 		t.Fatalf("rewind: %v", err)
 	}
 	// readIdx was reset to 0 by the fake rewind; the data block clears the
-	// counter, then the filemark is a clean io.EOF.
+	// counter, then the filemark is a clean ErrFilemark.
 	mustRead(t, tape.Tape, buf)
-	if _, err := tape.Read(buf); !errors.Is(err, io.EOF) {
-		t.Fatalf("after rewind want io.EOF, got %v", err)
+	if _, err := tape.ReadBlock(buf); !errors.Is(err, ErrFilemark) {
+		t.Fatalf("after rewind want ErrFilemark, got %v", err)
 	}
 }
 
@@ -486,14 +483,14 @@ func TestWriteFirstENOSPCIsEarlyWarningThenEndOfMedium(t *testing.T) {
 	defer mustClose(t, tape.Tape)
 	dev.forceENOSPC = true
 
-	_, err := tape.Write([]byte("x"))
+	_, err := tape.WriteBlock([]byte("x"))
 	if !errors.Is(err, ErrEarlyWarning) {
 		t.Fatalf("first ENOSPC: want ErrEarlyWarning, got %v", err)
 	}
 	if errors.Is(err, ErrEndOfMedium) {
 		t.Fatalf("first ENOSPC must not satisfy ErrEndOfMedium")
 	}
-	_, err = tape.Write([]byte("y"))
+	_, err = tape.WriteBlock([]byte("y"))
 	if !errors.Is(err, ErrEndOfMedium) {
 		t.Fatalf("second ENOSPC: want ErrEndOfMedium, got %v", err)
 	}
@@ -533,7 +530,7 @@ func BenchmarkWrite(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		if _, err := tape.Write(payload); err != nil {
+		if _, err := tape.WriteBlock(payload); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -548,7 +545,7 @@ func BenchmarkRead(b *testing.B) {
 	b.ResetTimer()
 	for range b.N {
 		dev.readIdx = 0
-		if _, err := tape.Read(buf); err != nil {
+		if _, err := tape.ReadBlock(buf); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -560,7 +557,7 @@ func BenchmarkSeek(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := range b.N {
-		if _, err := tape.Seek(int64(i), io.SeekStart); err != nil {
+		if err := tape.SeekBlock(int64(i)); err != nil {
 			b.Fatal(err)
 		}
 	}

@@ -1,7 +1,6 @@
 package tapedrive
 
 import (
-	"io"
 	"testing"
 )
 
@@ -63,9 +62,3 @@ func BenchmarkIocNumberLookup(b *testing.B) {
 		_ = ioctlMTIOCPOS
 	}
 }
-
-// Ensure io.Seeker/Reader/Writer/Closer keep compiling against the Tape type.
-var (
-	_ io.ReadSeeker      = (*Tape)(nil)
-	_ io.ReadWriteSeeker = (*Tape)(nil)
-)

@@ -3,14 +3,19 @@ package tapedrive
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"syscall"
 )
 
 // Tape is a handle to a Linux SCSI tape device node (/dev/st* auto-rewind,
-// /dev/nst* non-rewind). It satisfies io.Reader, io.Writer, io.Seeker,
-// io.Closer and every composition thereof in the io package.
+// /dev/nst* non-rewind).
+//
+// A tape is a record-oriented medium: a sequence of fixed- or variable-length
+// blocks grouped into files separated by filemarks. Tape access is therefore
+// not byte-stream access, and Tape deliberately does not implement io.Reader,
+// io.Writer or io.Seeker — those interfaces model a flat byte stream, which a
+// tape is not. Use ReadBlock / WriteBlock for data and the typed movement
+// methods (Rewind, ForwardSpaceFilemarks, SeekBlock, …) for positioning.
 //
 // A Tape is safe for use by a single goroutine at a time; the st driver
 // serializes commands per file descriptor.
@@ -18,7 +23,7 @@ type Tape struct {
 	fd             int
 	rewind         bool // device is the auto-rewind (/dev/st*) variant
 	closed         bool
-	zeroCount      int  // consecutive zero-byte reads (EOD detection)
+	zeroCount      int  // consecutive zero-byte reads (filemark / EOD detection)
 	atEarlyWarning bool // first write ENOSPC already signalled
 	ops            tapeOps
 }
@@ -66,9 +71,9 @@ func WithBlockSize(size int) Option {
 
 // WithSCSI2Logical enables logical block addressing (MT_ST_SCSI2LOGICAL).
 //
-// Required for Seek/Position to be meaningful on HPE Ultrium (LTO) drives:
-// without it the st driver uses a device-dependent address. Equivalent to
-// `mt -f <device> stsetoptions scsi2logical`; not preserved across reboots.
+// Required for SeekBlock/Position to be meaningful on HPE Ultrium (LTO)
+// drives: without it the st driver uses a device-dependent address. Equivalent
+// to `mt -f <device> stsetoptions scsi2logical`; not preserved across reboots.
 func WithSCSI2Logical(enable bool) Option {
 	return func(c *openConfig) { c.scsi2log = enable }
 }
@@ -125,59 +130,61 @@ func (t *Tape) applyConfig(cfg openConfig) error {
 	return nil
 }
 
-// OpenFile mirrors os.OpenFile for io/fs ergonomics. flags defaults to
-// O_RDWR|O_SYNC; perm is only relevant when creating a node.
-func OpenFile(name string, flags int, perm os.FileMode) (*Tape, error) {
-	return Open(name, WithFlags(flags), WithMode(uint32(perm)))
-}
-
 // Fd returns the underlying OS file descriptor. Callers must not close it
 // independently of Tape.Close.
 func (t *Tape) Fd() uintptr { return uintptr(t.fd) }
 
-// --- io.Reader / io.Writer -----------------------------------------------
+// --- record I/O ----------------------------------------------------------
 
-// Read implements io.Reader. In variable-block mode it reads exactly one
-// physical tape block into p. In fixed-block mode it transfers a multiple of
-// the block size.
+// ReadBlock reads one physical tape block into buf and returns the number of
+// bytes read.
 //
-// Per the st driver contract, read() returning 0 bytes signals a filemark
-// boundary: the first such read is reported as io.EOF for the current file.
-// Two consecutive zero-byte reads mean end of recorded data and are reported
-// as ErrEndOfData.
-func (t *Tape) Read(p []byte) (int, error) {
+// In variable-block mode each call returns exactly one block; buf must be at
+// least as large as the largest block on the tape, or the drive returns ENOMEM
+// (wrapped) and leaves the block unread. In fixed-block mode the byte count
+// returned is a multiple of the block size.
+//
+// At a filemark the drive returns zero bytes. ReadBlock surfaces that as
+// [ErrFilemark]; the tape is then positioned at the first block of the next
+// file, so the next ReadBlock returns data again. Two filemarks in a row with
+// no data between them mark the end of recorded data and are reported as
+// [ErrEndOfData]. Any tape-movement op (Rewind, SeekBlock, ForwardSpace*,
+// Offline, …) resets the filemark counter, so a lone filemark encountered
+// after a reposition is always ErrFilemark, never a spurious ErrEndOfData.
+func (t *Tape) ReadBlock(buf []byte) (int, error) {
 	if t.closed {
 		return 0, ErrNotOpen
 	}
-	if len(p) == 0 {
+	if len(buf) == 0 {
 		return 0, nil
 	}
-	n, err := t.ops.read(p)
+	n, err := t.ops.read(buf)
 	if err != nil {
-		return n, fmt.Errorf("tapedrive: read: %w", err)
+		return n, fmt.Errorf("tapedrive: read block: %w", err)
 	}
 	if n == 0 {
 		// The st driver returns zero bytes at a filemark. Two consecutive
-		// zero reads mean end of recorded data (st.rst); one is just the
-		// boundary between files, surfaced as io.EOF.
+		// zero reads (two filemarks, no data between) mean end of recorded
+		// data (st.rst); one is just the boundary between files.
 		t.zeroCount++
 		if t.zeroCount >= 2 {
 			return 0, ErrEndOfData
 		}
-		return 0, io.EOF
+		return 0, ErrFilemark
 	}
 	t.zeroCount = 0
 	return n, nil
 }
 
-// Write implements io.Writer. In variable-block mode each call writes exactly
-// one physical block of len(p) bytes. In fixed-block mode len(p) must be a
-// multiple of the block size.
+// WriteBlock writes one block of len(p) bytes to the tape. In variable-block
+// mode each call writes exactly one physical block; in fixed-block mode len(p)
+// must be a multiple of the block size.
 //
 // Near end of medium the st driver returns ENOSPC. The first such failure is
-// the early warning (ErrEarlyWarning) and one trailer write is still allowed;
-// a subsequent ENOSPC is the physical end of medium (ErrEndOfMedium).
-func (t *Tape) Write(p []byte) (int, error) {
+// the early warning ([ErrEarlyWarning]) and one trailer write is still
+// allowed; a subsequent ENOSPC is the physical end of medium
+// ([ErrEndOfMedium]).
+func (t *Tape) WriteBlock(p []byte) (int, error) {
 	if t.closed {
 		return 0, ErrNotOpen
 	}
@@ -193,70 +200,32 @@ func (t *Tape) Write(p []byte) (int, error) {
 			}
 			return n, fmt.Errorf("%w: %w", ErrEndOfMedium, err)
 		}
-		return n, fmt.Errorf("tapedrive: write: %w", err)
+		return n, fmt.Errorf("tapedrive: write block: %w", err)
 	}
 	return n, nil
 }
 
-// --- io.Seeker -----------------------------------------------------------
+// --- positioning ---------------------------------------------------------
 
-// Seek maps to MTSEEK and operates on logical block numbers (1 block == 1
-// physical tape record). For this to be meaningful the drive must be in
-// logical-block-addressing mode: pass WithSCSI2Logical(true) at Open for HPE
-// Ultrium (LTO) drives, or call EnableLogicalSeek.
+// SeekBlock positions the tape at the given logical block number using
+// MTSEEK. The block number is absolute with respect to the start of the
+// medium (or current partition); use [Tape.Position] to read it back.
 //
-// The returned offset is the new position relative to the start of the
-// (partition) medium, in blocks, obtained from MTIOCPOS after the seek.
-func (t *Tape) Seek(offset int64, whence int) (int64, error) {
+// For this to be meaningful the drive must be in logical-block-addressing
+// mode: pass WithSCSI2Logical(true) at Open for HPE Ultrium (LTO) drives, or
+// call EnableLogicalSeek. To reach the end of recorded data instead, use
+// SpaceToEnd.
+func (t *Tape) SeekBlock(block int64) error {
 	if t.closed {
-		return 0, ErrNotOpen
+		return ErrNotOpen
+	}
+	if block < 0 {
+		return errors.New("tapedrive: negative block number")
 	}
 	t.zeroCount = 0
-	var target int64
-	switch whence {
-	case io.SeekStart:
-		target = offset
-	case io.SeekCurrent:
-		cur, err := t.Position()
-		if err != nil {
-			return 0, err
-		}
-		target = cur + offset
-	case io.SeekEnd:
-		// "End" on tape = end of recorded data. Space there, then back off by
-		// |offset| blocks. MTSEEK after MTEOM is valid.
-		if err := t.mtop(OpEOM, 1); err != nil {
-			return 0, fmt.Errorf("tapedrive: seek to EOM: %w", err)
-		}
-		if offset < 0 {
-			if err := t.mtop(OpBSR, -offset); err != nil {
-				return 0, err
-			}
-		} else if offset > 0 {
-			if err := t.mtop(OpFSR, offset); err != nil {
-				return 0, err
-			}
-		}
-		return t.Position()
-	default:
-		return 0, fmt.Errorf("tapedrive: invalid whence %d", whence)
-	}
-	if target < 0 {
-		return 0, errors.New("tapedrive: negative seek position")
-	}
-	if err := t.seekBlock(target); err != nil {
-		return 0, err
-	}
-	return t.Position()
-}
-
-// seekBlock issues MTSEEK to the given logical block.
-func (t *Tape) seekBlock(block int64) error {
 	op := mtop{Op: OpSeek, Count: int32(block)}
-	return t.ioctlTop(&op)
+	return wrapOp("seek block", t.ioctlTop(&op))
 }
-
-// --- position ---------------------------------------------------------------
 
 // Position returns the current logical block number via MTIOCPOS. Requires
 // logical block addressing on HPE Ultrium drives (WithSCSI2Logical).
@@ -270,9 +239,6 @@ func (t *Tape) Position() (int64, error) {
 	}
 	return pos.Blkno, nil
 }
-
-// Tell is an alias for Position matching the mt(1) command name.
-func (t *Tape) Tell() (int64, error) { return t.Position() }
 
 // --- status --------------------------------------------------------------
 
@@ -320,7 +286,7 @@ func (t *Tape) Status() (Status, error) {
 	}, nil
 }
 
-// --- io.Closer -----------------------------------------------------------
+// --- lifecycle -----------------------------------------------------------
 
 // Close closes the underlying file descriptor.
 //
@@ -500,7 +466,7 @@ func (t *Tape) Flush() error { return wrapOp("flush", t.mtop(OpNoOp, 1)) }
 // SetDriverBooleans sets the boolean driver/mode options given by mask
 // (combine Opt* constants). This is the MTSETDRVBUFFER MT_ST_SETBOOLEANS
 // subcommand. Notably OptSCSI2Logical enables logical-block addressing for
-// Seek/Position on HPE Ultrium drives.
+// SeekBlock/Position on HPE Ultrium drives.
 func (t *Tape) SetDriverBooleans(mask int) error {
 	if t.closed {
 		return ErrNotOpen
@@ -520,7 +486,7 @@ func (t *Tape) ClearDriverBooleans(mask int) error {
 
 // EnableLogicalSeek enables logical-block addressing (MT_ST_SCSI2LOGICAL),
 // equivalent to `mt -f <dev> stsetoptions scsi2logical`. Required for
-// Seek/Position to be meaningful on HPE Ultrium drives. Idempotent.
+// SeekBlock/Position to be meaningful on HPE Ultrium drives. Idempotent.
 func (t *Tape) EnableLogicalSeek() error {
 	return t.SetDriverBooleans(OptSCSI2Logical)
 }
@@ -568,15 +534,3 @@ func isAutoRewindDevice(name string) bool {
 	}
 	return len(name) > 0 && name[0] == 's'
 }
-
-// Compile-time interface satisfaction.
-var (
-	_ io.Reader          = (*Tape)(nil)
-	_ io.Writer          = (*Tape)(nil)
-	_ io.Seeker          = (*Tape)(nil)
-	_ io.Closer          = (*Tape)(nil)
-	_ io.ReadSeeker      = (*Tape)(nil)
-	_ io.ReadWriteSeeker = (*Tape)(nil)
-	_ io.ReadWriteCloser = (*Tape)(nil)
-	_ io.ReadSeekCloser  = (*Tape)(nil)
-)

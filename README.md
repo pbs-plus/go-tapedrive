@@ -1,13 +1,19 @@
 # go-tapedrive
 
-A Go 1.26 library that exposes the Linux SCSI tape (`st`) driver through the
-standard `io` interfaces — `io.Reader`, `io.Writer`, `io.Seeker`, `io.Closer`
-and every composition thereof (`io.ReadSeeker`, `io.ReadWriteSeeker`,
-`io.ReadWriteCloser`, `io.ReadSeekCloser`).
+A Go 1.26 binding for the Linux SCSI tape (`st`) driver.
 
-The Read / Write / Seek / Status hot paths perform **zero heap allocations**:
-the kernel copies directly into and out of caller-supplied buffers and every
-ioctl argument lives on the stack or inside the `Tape` struct.
+A tape is a **record-oriented** medium — a sequence of blocks grouped into
+files separated by filemarks — **not** a byte stream. So `Tape` deliberately
+does **not** implement `io.Reader`, `io.Writer` or `io.Seeker`. Forcing those
+interfaces onto a tape (filemarks as `io.EOF`, byte offsets for `Seek`, hidden
+zero-read counters) makes the API misleading. Instead `ReadBlock` / `WriteBlock`
+move one physical tape block per call, and a filemark seen while reading is an
+explicit `ErrFilemark`.
+
+The `ReadBlock` / `WriteBlock` / `SeekBlock` / `Status` hot paths perform
+**zero heap allocations**: the kernel copies directly into and out of
+caller-supplied buffers and every ioctl argument lives on the stack or inside
+the `Tape` struct.
 
 ## Install
 
@@ -23,13 +29,13 @@ library (`syscall`, `unsafe`).
 ```go
 t, err := tapedrive.Open("/dev/nst0",
     tapedrive.WithBlockSize(0),       // variable-block mode (default)
-    tapedrive.WithSCSI2Logical(true), // required for Seek/Position on HPE Ultrium
+    tapedrive.WithSCSI2Logical(true), // required for SeekBlock/Position on HPE Ultrium
 )
 if err != nil { log.Fatal(err) }
 defer t.Close()
 
-// Write a record (one physical tape block per Write in variable mode).
-if _, err := t.Write(rec); err != nil { log.Fatal(err) }
+// Write a record (one physical tape block per WriteBlock in variable mode).
+if _, err := t.WriteBlock(rec); err != nil { log.Fatal(err) }
 
 // Filemark, rewind, read back.
 if err := t.WriteFilemarks(1); err != nil { log.Fatal(err) }
@@ -37,11 +43,11 @@ if err := t.Rewind(); err != nil { log.Fatal(err) }
 
 buf := make([]byte, maxBlock)
 for {
-    n, err := t.Read(buf)
+    n, err := t.ReadBlock(buf)
     switch {
     case errors.Is(err, tapedrive.ErrEndOfData):
         return // two filemarks in a row: no more recorded data on the tape
-    case errors.Is(err, io.EOF):
+    case errors.Is(err, tapedrive.ErrFilemark):
         continue // crossed one filemark: end of the current file
     case err != nil:
         return err
@@ -50,20 +56,19 @@ for {
 }
 ```
 
-It slots directly into `io.Copy`, `bufio`, `archive/tar`, etc.
-
 ## Read semantics
 
-The `st` driver returns zero bytes at a filemark. This library follows
-`st.rst` exactly:
+The `st` driver returns zero bytes at a filemark. This library surfaces that
+directly instead of hiding it behind `io.EOF`:
 
-* A **single** zero-byte read is a filemark boundary — reported as `io.EOF`.
-  The next `Read` returns the first block of the next file.
-* **Two consecutive** zero-byte reads mean end of recorded data — reported as
-  `ErrEndOfData`.
-* Any tape-movement op (`Seek`, `Rewind`, `ForwardSpace*`, `Offline`, …)
+* A **single** zero-byte read is a filemark boundary — reported as
+  `ErrFilemark`. The next `ReadBlock` returns the first block of the next
+  file.
+* **Two consecutive** zero-byte reads (two filemarks with no data between)
+  mean end of recorded data — reported as `ErrEndOfData`.
+* Any tape-movement op (`SeekBlock`, `Rewind`, `ForwardSpace*`, `Offline`, …)
   resets the consecutive-zero counter, so a single filemark after a reposition
-  is always `io.EOF`, never a spurious `ErrEndOfData`.
+  is always `ErrFilemark`, never a spurious `ErrEndOfData`.
 
 ## Write semantics near end of medium
 
@@ -76,7 +81,7 @@ write is still permitted.
 * A subsequent `ENOSPC` is reported as `ErrEndOfMedium` — the physical end of
   medium has been reached.
 
-## HPE Ultrium (LTO) drives — seek & tell
+## HPE Ultrium (LTO) drives — seek & position
 
 The `mt` seek/tell commands need logical block addressing. With the `st`
 driver that means `MT_ST_SCSI2LOGICAL`:
@@ -94,8 +99,9 @@ tapedrive.Open("/dev/nst0", tapedrive.WithSCSI2Logical(true))
 t.EnableLogicalSeek()
 ```
 
-`Seek` then maps to `MTSEEK` and `Position`/`Tell` to `MTIOCPOS`, both in
-logical block numbers.
+`SeekBlock` then maps to `MTSEEK` and `Position` to `MTIOCPOS`, both in
+logical block numbers. `SeekBlock` is absolute; to reach the end of recorded
+data use `SpaceToEnd`.
 
 ## Status
 
@@ -115,8 +121,8 @@ Predicates: `EOF`, `BOT`, `EOT`, `EOD`, `Online`, `WriteProtected`,
 
 ## API surface
 
-Lifecycle / io: `Open`, `OpenFile`, `Close`, `Fd`, `Read`, `Write`, `Seek`,
-`Position` / `Tell`, `Status`.
+Lifecycle / records: `Open`, `Close`, `Fd`, `ReadBlock`, `WriteBlock`,
+`SeekBlock`, `Position`, `Status`.
 
 Options (functional options on `Open`): `WithFlags`, `WithMode`,
 `WithBlockSize`, `WithSCSI2Logical`, `WithDriverOptions`.
@@ -141,7 +147,7 @@ Low level: `MTOP(op, count)` plus the exported `Op*` operation constants
 
 Sentinels (match with `errors.Is`):
 
-* `io.EOF` — filemark boundary crossed (end of the current file).
+* `ErrFilemark` — filemark boundary crossed (end of the current file).
 * `ErrEndOfData` — two consecutive filemarks; no more recorded data.
 * `ErrEarlyWarning` — first write `ENOSPC`; a trailer write is still allowed.
 * `ErrEndOfMedium` — physical end of medium reached.

@@ -5,9 +5,14 @@ import "errors"
 // Sentinel errors returned by this package. Wrap with %w and match with
 // errors.Is. They reflect the st driver semantics documented in st.rst.
 var (
-	// ErrEndOfData is returned when a read returns zero bytes twice in a row:
-	// the first zero is a filemark (reported as io.EOF), the second means
-	// there is no more recorded data on the tape.
+	// ErrFilemark is returned by ReadBlock when the drive reports a filemark:
+	// no data was read and the tape is now positioned at the first block of
+	// the next file. A subsequent ReadBlock returns that block.
+	ErrFilemark = errors.New("tapedrive: filemark")
+	// ErrEndOfData is returned by ReadBlock when two filemarks appear in a
+	// row with no data between them: there is no more recorded data on the
+	// tape. Any tape-movement op resets the filemark counter so a lone
+	// filemark after a reposition stays an ErrFilemark.
 	ErrEndOfData = errors.New("tapedrive: end of recorded data")
 	// ErrEarlyWarning is returned on the first write that fails with ENOSPC.
 	// Per st.rst the early-warning window still allows one trailer write; the

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -164,8 +165,42 @@ func (d *Drive) Status() (Status, error) {
 	}, nil
 }
 
-// Rewind rewinds to beginning of tape.
-func (d *Drive) Rewind() error { return d.mtop(mtrew, 1) }
+// Rewind rewinds to beginning of tape and blocks until the drive confirms BOT
+// via hardware status (GMT_BOT from MTIOCGET). It retries up to 3 times with a
+// 250 ms settling delay when the drive hasn't asserted BOT yet — needed after a
+// mid-read kill where the firmware may still be draining a prior SCSI command.
+// The block counter (MTIOCPOS) is also verified to be 0.
+func (d *Drive) Rewind() error {
+	for attempt := range 3 {
+		if err := d.mtop(mtrew, 1); err != nil {
+			return fmt.Errorf("tapedrive: rewind: %w", err)
+		}
+		pos, posErr := d.TellBlock()
+		st, stErr := d.Status()
+		if posErr == nil && stErr == nil && pos == 0 && st.BOT {
+			return nil
+		}
+		if attempt < 2 {
+			// Pause to let the drive settle. The st driver may queue commands
+			// internally; MTREW returns after the command is *accepted*, not
+			// after the drive has physically repositioned. 250 ms matches the
+			// typical LTO seek-to-BOT time for a mid-tape rewind.
+			mtnopWait(d)
+		}
+	}
+	return fmt.Errorf("tapedrive: rewind: drive did not report BOT after 3 attempts")
+}
+
+// mtnopWait issues MTNOP to flush the driver buffer and then waits for the
+// settle interval. MTNOP is the recommended way to force the st driver to
+// synchronise with the hardware before the next MTIOCGET (st(4)).
+func mtnopWait(d *Drive) {
+	// Best-effort flush; failure is harmless — the retry loop above will catch
+	// a drive that genuinely failed to rewind.
+	_ = d.mtop(mtnop, 1)
+	// Drive firmware may need a few hundred ms to reposition.
+	time.Sleep(250 * time.Millisecond)
+}
 
 // EOM positions the tape at end of recorded data (for appending).
 func (d *Drive) EOM() error { return d.mtop(mteom, 1) }

@@ -41,8 +41,7 @@ const MaxBlockSize = 1 << 26 // 64 MiB
 
 // Open opens a no-rewinding SCSI tape device read-only.
 func Open(name string) (*Drive, error) {
-	flags := unix.O_RDONLY &^ unix.O_CLOEXEC // some st drivers reject O_CLOEXEC ioctls
-	fd, err := unix.Open(name, flags, 0)
+	fd, err := unix.Open(name, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("tapedrive: open %s: %w", name, err)
 	}
